@@ -1,0 +1,10 @@
+{
+  "name": "loxe",
+  "version": "0.1.0",
+  "dependencies": [
+    {
+      "name": "qt6-base",
+      "version>=": "6.4.0"
+    }
+  ]
+}

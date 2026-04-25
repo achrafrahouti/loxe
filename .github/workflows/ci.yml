@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_name: loxe.AppImage
+          - os: macos-13
+            artifact_name: loxe.dmg
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: "6.6.*"
+          cache: true
+
+      - name: Configure (Release)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package (Linux AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy*.AppImage
+          QMAKE=$(which qmake6 || which qmake) \
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable build/src/loxe \
+            --desktop-file packaging/linux/loxe.desktop \
+            --plugin qt \
+            --output appimage
+
+      - name: Package (macOS DMG)
+        if: runner.os == 'macOS'
+        run: |
+          macdeployqt build/src/loxe.app
+          # TODO: codesign and notarise
+          hdiutil create -volname loxe -srcfolder build/src/loxe.app -ov -format UDZO loxe.dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: warn

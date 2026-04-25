@@ -1,0 +1,11 @@
+build/
+.cache/
+*.user
+*.AppImage
+*.dmg
+*.o
+*.a
+*.so
+*.dylib
+CMakeCache.txt
+CMakeFiles/

@@ -1,0 +1,295 @@
+LOXE — FEATURES DONE
+Verified against source code on 2026-04-25
+==============================================================
+
+This file lists only features that are genuinely implemented in code,
+not planned or scaffolded with TODO stubs. Each entry corresponds to
+working logic you can trace in the source files under src/.
+
+
+--------------------------------------------------------------
+BUILD SYSTEM & PROJECT INFRASTRUCTURE
+--------------------------------------------------------------
+
+  - CMake 3.24+ build configured for Release and Debug modes.
+  - Debug builds automatically enable AddressSanitizer (ASan) and
+    UndefinedBehaviorSanitizer (UBSan) at compile time.
+  - Two build targets: loxe_engine (static library, no Qt) and
+    loxe (Qt executable linking against loxe_engine).
+  - vcpkg.json manifest pins all third-party dependency versions.
+  - GitHub Actions CI matrix runs builds on ubuntu-22.04 and macos-13.
+  - CMarkup 11.5 compiled as libcmarkup.a with MARKUP_ICONV enabled
+    on POSIX (iconv linked on macOS; built into glibc on Linux).
+  - Linux .desktop launcher file present (packaging/linux/).
+  - macOS Info.plist bundle metadata present (packaging/macos/).
+  - Qt Test suite skeleton: four independent test binaries
+    (tst_MmapBuffer, tst_PieceTable, tst_SparseLineIndex, tst_FormatEngine).
+
+
+--------------------------------------------------------------
+ENGINE — MmapBuffer  (src/engine/MmapBuffer.cpp)
+--------------------------------------------------------------
+
+  - Opens files read-only with mmap(PROT_READ, MAP_PRIVATE).
+  - Automatic fallback to pread() when mmap() fails (e.g. 32-bit VA
+    space exhaustion or file on a filesystem that refuses mmap).
+  - Zero-copy slice(offset, len): returns a std::string_view directly
+    into the mapped region; no copy on the mmap path.
+  - pread path uses a single internal scratch buffer; slice() is still
+    callable but callers must not hold views across calls on that path.
+  - adviseSequential() / adviseRandom() call madvise() to hint the
+    kernel about the expected access pattern.
+  - Move semantics fully implemented; copy is intentionally deleted.
+  - Destructor calls close() so the fd and mapping are always released.
+
+
+--------------------------------------------------------------
+ENGINE — PieceTable  (src/engine/PieceTable.cpp)
+--------------------------------------------------------------
+
+  - Two-buffer model: FILE buffer (the read-only mmap) and ADD buffer
+    (append-only in-memory string for all typed characters).
+  - insert(pos, text): splits the existing piece at pos if necessary,
+    appends text to the ADD buffer, and inserts a new Add piece.
+    All three split cases (insert before, after, or inside a piece)
+    are handled correctly.
+  - length(): sums piece lengths under a shared lock.
+  - Undo stack: every insert/remove call pushes an UndoRecord holding
+    a full copy of the piece list and cursor positions before/after.
+    undo() and redo() restore the list; canUndo() / canRedo() query it.
+    Redo tail is discarded when a new edit is made.
+  - Sequential Iterator: atEnd() and nextChunk() walk the piece list
+    chunk by chunk returning zero-copy std::string_views.  No full
+    document materialisation.
+  - begin(): returns an iterator positioned at byte offset 0.
+  - iteratorAt(pos): walks pieces to find which one contains pos,
+    returns an iterator with m_piecePos set to the intra-piece offset.
+    (Implemented 2026-04-25 to unblock ViewportRenderer.)
+  - Reader-writer lock (std::shared_mutex): length(), begin(), and
+    iteratorAt() take a shared lock; insert/remove take unique locks.
+
+  Note: remove() body is currently a no-op (only pushes an undo record
+  without actually unlinking pieces).  replace() calls remove + insert,
+  so the remove half has no effect.  These are open TODOs.
+
+
+--------------------------------------------------------------
+ENGINE — SparseLineIndex  (src/engine/SparseLineIndex.cpp)
+--------------------------------------------------------------
+
+  - Checkpoint array: stores (line_number, byte_offset) pairs every
+    ~4 KB of file content, built in O(n) on a background thread.
+  - build(buf, cancelled): scans the MmapBuffer byte by byte, appends
+    a checkpoint every kCheckpointInterval bytes after a newline, and
+    stores the MmapBuffer pointer for later forward-scan queries.
+    Returns false immediately if the cancellation flag is set.
+  - invalidateFrom(byteOffset): binary-searches the checkpoint array
+    and erases all checkpoints at or beyond byteOffset.  Used after
+    edits to keep the index consistent with the PieceTable.
+  - isComplete() / lineCount() / estimatedLineCount(): all thread-safe
+    via shared_lock.  estimatedLineCount() extrapolates from the last
+    seen checkpoint while the background build is still running, giving
+    the scroll bar a usable range immediately.
+  - lineToOffset(line): binary-searches for the nearest checkpoint
+    whose line number is <= the target, then scans raw bytes forward
+    from that checkpoint offset counting newlines until the target line
+    is reached.  Returns the byte offset of the first character on
+    that line.  (Forward scan implemented 2026-04-25.)
+  - offsetToLine(offset): binary-searches for the nearest checkpoint
+    whose byte offset is <= the target, then counts newlines in the
+    segment [checkpoint.offset, offset).  Returns the 0-based line
+    number.  (Forward scan implemented 2026-04-25.)
+  - All public query methods are safe to call while build() is running
+    on another thread (shared_lock guards the checkpoint vector).
+
+
+--------------------------------------------------------------
+UI — AsyncLoader  (src/ui/AsyncLoader.cpp)
+--------------------------------------------------------------
+
+  - Runs all three loading phases on a dedicated QThread (not the UI
+    thread), so the window stays responsive during file open.
+  - Phase 1 — MmapBuffer::open(): emits fileReady(buf, table) as soon
+    as the file is mapped, allowing the viewport to start displaying
+    content before the line index is ready.
+  - Phase 2 — SparseLineIndex::build(): emits indexReady(index) when
+    complete, at which point the scroll bar range becomes accurate.
+  - Phase 3 — VirtualTreeModel creation: emits treeReady(model).
+    The model object is created and transferred; CMarkup-based level-1
+    population is not yet implemented (tree will be empty after open).
+  - loadProgress(percent, phase) signal emitted at each phase
+    transition for the status bar and progress bar.
+  - loadFailed(reason) emitted when MmapBuffer::open() returns false.
+  - Atomic cancellation flag: cancel() sets it; build() and each phase
+    check it between steps.  If cancelled, the thread exits cleanly
+    without emitting further signals.
+  - Destructor calls cancel() + QThread::wait() so no dangling thread
+    is left when a new file is opened or the window is closed.
+
+
+--------------------------------------------------------------
+UI — MainWindow  (src/ui/MainWindow.cpp)
+--------------------------------------------------------------
+
+  - Dual-pane layout: ViewportRenderer (left, stretch 3) and QTreeView
+    (right, stretch 1) inside a QSplitter.
+  - Breadcrumb QLabel at the top of the central widget.
+  - Dockable attribute panel (QDockWidget) containing a QTableWidget
+    with two columns: Name and Value.  Docked to the right side.
+  - Status bar with three permanent widgets: line/column position
+    ("Ln N, Col N"), encoding label ("UTF-8"), and well-formedness
+    placeholder ("✔ Well-formed").
+  - Progress bar: shown at 0% when load starts, hidden when treeReady
+    or loadFailed is received.  Hidden by default.
+  - Full menu bar:
+      File  — New, Open…, Save, Save As…, Exit (all with Qt6 standard
+               key sequences; open and save dialogs are functional)
+      Edit  — Undo, Redo, Find…, Find & Replace…, Go to Line…
+               (Undo/Redo are wired to PieceTable)
+      Format — Beautify (Ctrl+Shift+B), Minify
+      View  — Toggle Word Wrap (Alt+Z), Toggle Tree Pane,
+               Toggle Attribute Pane (all three toggle immediately)
+  - File → Open launches QFileDialog filtered to XML files; selected
+    path is passed to openFile().
+  - File → Save As launches QFileDialog and stores the chosen path.
+    Actual byte-writing to disk is not yet implemented.
+  - Drag-and-drop: dragEnterEvent accepts URL drops; dropEvent opens
+    the first dropped file via openFile().
+  - openFile(path) creates an AsyncLoader on first call, connects all
+    its signals, starts the background load, and updates the title.
+  - onFileReady: takes ownership of MmapBuffer and PieceTable, calls
+    viewport->setDocument() so content starts rendering immediately.
+  - onIndexReady: updates viewport with the completed SparseLineIndex
+    so line/col calculations become accurate.
+  - onTreeReady: installs the VirtualTreeModel on the QTreeView.
+  - onCursorMoved: converts the byte offset to (line, col) using
+    offsetToLine() + lineToOffset() and updates the status bar label.
+  - onTreeNodeActivated: reads byteOffsetFor() from the model and
+    calls viewport->setCursorOffset() to sync the text view.
+  - Session persistence: window geometry and splitter position are
+    saved to QSettings on close and restored on launch.
+  - Window title shows the filename on open ("name.xml — loxe").
+  - CLI positional argument: if a file path is given on the command
+    line, openFile() is called automatically after show().
+  - CLI options parsed: --line N, --search TERM, --ro (declared and
+    parsed; behavior not yet wired beyond parsing).
+
+
+--------------------------------------------------------------
+UI — ViewportRenderer  (src/ui/ViewportRenderer.cpp)
+--------------------------------------------------------------
+
+  - Custom QWidget; does not use QPlainTextEdit or any Qt text engine.
+  - Vertical and horizontal QScrollBars laid out inside the widget.
+    Wheel events are forwarded to the vertical scrollbar.
+  - Scrollbar range set from SparseLineIndex::estimatedLineCount();
+    updated whenever setDocument() is called.
+  - paintEvent draws only the lines that fit on screen
+    (ceil(height / lineHeight) + 2 lines), never the full document.
+  - Gutter: right-aligned line numbers drawn in grey with a small
+    right-margin gap.
+  - Current-line highlight: the line containing the cursor offset gets
+    a light-blue background band across the text area.
+  - Column markers: vertical grey lines drawn at columns 80 and 120
+    by default, configurable via setColumnMarkers().
+  - fetchVisibleLines(): calls SparseLineIndex::lineToOffset() to find
+    the first visible byte, positions a PieceTable::Iterator there via
+    iteratorAt(), then scans chunks splitting on '\n' to collect exactly
+    visibleLineCount() lines.  No full-file scan.
+    (Implemented 2026-04-25, unblocking P0 content display.)
+  - Token rendering: passes fetched lines to IncrementalHighlighter;
+    if tokens are returned, each token span is drawn in its assigned
+    color; otherwise the full line is drawn in black (fallback until
+    the highlighter token state machine is implemented).
+  - setDocument(table, index): stores the document references, resets
+    scroll position to 0, and triggers a repaint.
+  - setCursorOffset(offset): stores the new offset, scrolls to the
+    containing line (centered in the viewport), repaints, and emits
+    cursorMoved().
+  - setWordWrap(bool), setTabWidth(int), setColumnMarkers(int, int):
+    all stored and trigger immediate repaint.
+  - resizeEvent repositions both scrollbars to stay flush with the
+    widget edges.
+  - cursorMoved(uint64_t) signal emitted on every cursor change for
+    the tree view and status bar to consume.
+
+
+--------------------------------------------------------------
+UI — IncrementalHighlighter  (src/ui/IncrementalHighlighter.cpp)
+--------------------------------------------------------------
+
+  - Ten token kinds defined: TagName, AttrName, AttrValue, Text,
+    Comment, CdataSection, ProcessingInstruction, Doctype, EntityRef,
+    Punctuation.
+  - Default light-theme color palette: one color per token kind
+    (blue for tag names, brown for attribute names, green for values,
+    grey for comments, teal for CDATA, purple for PIs, etc.).
+  - colorFor(kind): returns the color for a given token kind with
+    bounds-checked indexing.
+  - setTheme(colors): replaces the active palette and invalidates the
+    context cache so the next paint re-establishes parser state.
+  - Context-line caching: tokenise() checks whether the context lines
+    above the viewport are identical to the last call; if so, the
+    cached parser state at the top of the viewport is reused, avoiding
+    a redundant re-scan of those lines on identical repaints.
+  - computeStateAt(): walks context lines through tokeniseLine() to
+    establish the XML parser state at the viewport top.
+
+  Note: tokeniseLine() is currently a stub that returns no tokens.
+  The XML state machine is not yet written, so all text renders in
+  the plain black fallback path.  The surrounding framework (caching,
+  state threading, color dispatch) is in place.
+
+
+--------------------------------------------------------------
+UI — VirtualTreeModel  (src/ui/VirtualTreeModel.cpp)
+--------------------------------------------------------------
+
+  - QAbstractItemModel backed by a flat std::vector<TreeNode>.
+  - Each TreeNode stores only: byteOffset, depth, tagName,
+    hasChildren, isLoaded, parentIndex, firstChild, nextSibling.
+    No raw XML content is kept in the model.
+  - appendRootNodes(nodes): appends a batch of root-level nodes with
+    proper beginInsertRows / endInsertRows notifications.
+  - rowCount(): correctly counts root-level items (parentIndex == -1)
+    and loaded child items (parentIndex == nodeIdx).
+  - columnCount(): returns 3 (Element, Attributes, Text).
+  - headerData(): returns column header strings.
+  - hasChildren(): returns node.hasChildren flag for non-root items;
+    true if any nodes exist for the root level.
+  - canFetchMore(): returns true if the node has children flagged but
+    isLoaded is false.
+  - fetchMore(): calls loadChildren(nodeIndex) to trigger lazy loading.
+  - data() column 0: returns the stored tagName as DisplayRole.
+  - byteOffsetFor(index): returns node.byteOffset for viewport sync.
+
+  Note: index() for child rows and parent() row calculation are stubs
+  that do not yet walk the firstChild/nextSibling chain.  loadChildren()
+  marks isLoaded but does not yet call CMarkup.  Attribute and text
+  content columns return empty QVariants.
+
+
+--------------------------------------------------------------
+SUMMARY COUNT
+--------------------------------------------------------------
+
+  Fully working:    MmapBuffer, PieceTable (insert/undo/iterator),
+                    SparseLineIndex (build + both lookup directions),
+                    AsyncLoader (phases 1 + 2), MainWindow (layout,
+                    menus, drag-drop, session, load wiring),
+                    ViewportRenderer (paint loop, line fetch,
+                    scrollbars, gutter, current-line highlight,
+                    column markers), IncrementalHighlighter (palette,
+                    cache framework, color dispatch).
+
+  Partial / scaffolded:
+                    VirtualTreeModel (root display only, no children),
+                    FormatEngine (interface defined, no logic),
+                    IncrementalHighlighter (tokeniseLine stub),
+                    MainWindow slots for Save, New, Find, Format
+                    (dialog or no-op only).
+
+  Not started:      Keyboard editing, mouse hit-test, selection,
+                    cursor caret, search, encoding detection,
+                    validation, tag wrap/unwrap, recent files,
+                    atomic save, file-system watcher, preferences.

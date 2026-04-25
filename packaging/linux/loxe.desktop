@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=loxe
+GenericName=XML Editor
+Comment=High-performance XML editor for large files
+Exec=loxe %F
+Icon=loxe
+Terminal=false
+Type=Application
+Categories=Development;Utility;TextEditor;
+MimeType=application/xml;text/xml;
+Keywords=xml;editor;large;
+StartupWMClass=loxe
