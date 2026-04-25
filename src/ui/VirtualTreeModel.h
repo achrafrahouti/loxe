@@ -5,28 +5,29 @@
 #include <cstdint>
 #include <vector>
 
-class MmapBuffer;
-
 struct TreeNode {
-    uint64_t byteOffset  = 0;
-    int      depth       = 0;
-    QString  tagName;
-    bool     hasChildren = false;
-    bool     isLoaded    = false; // true once children have been fetched
-    int      parentIndex = -1;   // index into m_nodes; -1 for root items
-    int      firstChild  = -1;   // index of first child node, -1 if none loaded
-    int      nextSibling = -1;   // index of next sibling, -1 if last
+    uint64_t         byteOffset  = 0;
+    int              depth       = 0;
+    QString          tagName;
+    QString          attrSummary;  // [@attr="val"] shown in Attributes column
+    QString          textPreview;  // ≤60 chars text content for Text column
+    bool             hasChildren = false;
+    bool             isLoaded    = false;
+    int              parentIndex = -1;
+    int              firstChild  = -1;
+    int              nextSibling = -1;
+    std::vector<int> navPath;      // sibling indices from XML root to reach this node
 };
 
-// QAbstractItemModel backed by an array of (byte_offset, depth, tag_name) tuples.
-// Stores NO full node content — child data is loaded lazily via fetchMore()
-// by seeking CMarkup to the stored byte_offset.
+// QAbstractItemModel backed by a flat std::vector<TreeNode>.
+// Each node stores only (byteOffset, depth, tagName) plus navigation links.
+// Children are loaded lazily via fetchMore() using CMarkup streaming on demand.
 class VirtualTreeModel : public QAbstractItemModel {
     Q_OBJECT
 public:
-    explicit VirtualTreeModel(MmapBuffer* buf, QObject* parent = nullptr);
+    explicit VirtualTreeModel(const QString& filePath, QObject* parent = nullptr);
 
-    // Append root-level nodes from the level-1 background parse.
+    // Append root-level nodes (called from AsyncLoader Phase 3).
     void appendRootNodes(std::vector<TreeNode> nodes);
 
     // QAbstractItemModel interface
@@ -46,12 +47,15 @@ public:
     uint64_t byteOffsetFor(const QModelIndex& index) const;
 
 private:
-    // Parse children of the node at nodeIndex using CMarkup positioned at its byteOffset.
+    // Open a fresh CMarkup, navigate to nodeIndex's path, populate its children.
     void loadChildren(int nodeIndex);
 
-    // Returns the node index stored in a QModelIndex (encoded as internalId).
+    // Returns the node index encoded in a QModelIndex internalId.
     int nodeIndexOf(const QModelIndex& idx) const;
 
-    MmapBuffer*           m_buf;
+    // Returns the row of nodeIdx among its siblings (O(siblings)).
+    int rowOfNode(int nodeIdx) const;
+
+    QString               m_filePath;
     std::vector<TreeNode> m_nodes;
 };

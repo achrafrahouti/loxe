@@ -3,6 +3,7 @@
 #include "../engine/MmapBuffer.h"
 #include "../engine/PieceTable.h"
 #include "../engine/SparseLineIndex.h"
+#include "Markup.h"
 
 #include <QMetaObject>
 
@@ -69,9 +70,43 @@ void AsyncLoader::run()
     // --- Phase 3: VirtualTreeModel level-1 parse ---
     emit loadProgress(80, "Parsing tree structure…");
 
-    auto* model = new VirtualTreeModel(buf);
-    // TODO: use CMarkup to seek buf and populate root-level nodes
-    emit treeReady(model);
+    auto* model = new VirtualTreeModel(m_path);
 
+    CMarkup markup(CMarkup::MDF_READFILE);
+    if (markup.Load(m_path.toStdString()) && markup.FindElem()) {
+        markup.IntoElem();  // enter XML root element
+
+        std::vector<TreeNode> roots;
+        int sibIdx = 0;
+        while (!m_cancel.load() && markup.FindElem()) {
+            TreeNode node;
+            node.tagName     = QString::fromStdString(markup.GetTagName());
+            node.depth       = 1;
+            node.parentIndex = -1;
+            node.navPath     = {sibIdx};
+
+            std::string aName, aVal;
+            if (markup.GetNthAttrib(1, aName, aVal) && !aName.empty())
+                node.attrSummary = QString("[@%1=\"%2\"]")
+                    .arg(QString::fromStdString(aName))
+                    .arg(QString::fromStdString(aVal).left(30));
+
+            const std::string preview = markup.GetData();
+            if (!preview.empty())
+                node.textPreview = QString::fromUtf8(preview.c_str()).simplified().left(60);
+
+            markup.IntoElem();
+            node.hasChildren = markup.FindElem();
+            markup.OutOfElem();
+
+            roots.push_back(std::move(node));
+            ++sibIdx;
+        }
+
+        if (!roots.empty())
+            model->appendRootNodes(std::move(roots));
+    }
+
+    emit treeReady(model);
     emit loadProgress(100, "Done");
 }
