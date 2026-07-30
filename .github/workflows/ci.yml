@@ -21,6 +21,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Qt 6.5+ links its XCB platform plugin against libxcb-cursor, which is
+      # not present on the GitHub runner image. linuxdeploy-plugin-qt resolves
+      # every ELF dependency of libqxcb.so, so a missing one fails packaging
+      # with "Could not find dependency: libxcb-cursor.so.0".
+      - name: Install XCB runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-sync1 \
+            libxcb-xfixes0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1 \
+            libxkbcommon-x11-0
+
       - name: Install Qt
         uses: jurplel/install-qt-action@v3
         with:
@@ -39,14 +61,24 @@ jobs:
       - name: Package (Linux AppImage)
         if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          # Fetched explicitly rather than relying on it being bundled, so
+          # "--output appimage" cannot fail for a missing plugin.
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
           chmod +x linuxdeploy*.AppImage
+          # --icon-file is required: loxe.desktop declares Icon=loxe, and
+          # linuxdeploy refuses a desktop file whose icon is not deployed.
+          # OUTPUT pins the artifact name, which otherwise gains an arch suffix
+          # and no longer matches the upload step.
+          OUTPUT=${{ matrix.artifact_name }} \
           QMAKE=$(which qmake6 || which qmake) \
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --executable build/src/loxe \
             --desktop-file packaging/linux/loxe.desktop \
+            --icon-file packaging/linux/loxe.png \
             --plugin qt \
             --output appimage
 
@@ -62,4 +94,6 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
-          if-no-files-found: warn
+          # Fail loudly: "warn" previously let a broken packaging step upload
+          # an empty artifact while the job still went green.
+          if-no-files-found: error

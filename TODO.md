@@ -144,11 +144,17 @@ are not "fixed" by accident.
 
 ## Packaging & Distribution
 
-- [ ] AppImage: integrate `linuxdeploy` + Qt plugin into CI (Linux job)
-- [ ] macOS: `macdeployqt` + `create-dmg`, code-sign and notarise
+- [x] AppImage: `linuxdeploy` + Qt plugin wired into the CI Linux job
+- [x] Application icon (`packaging/linux/loxe.png`), required by `linuxdeploy`
+      because `loxe.desktop` declares `Icon=loxe`
+- [ ] macOS: `create-dmg` instead of raw `hdiutil`, plus code-signing and
+      notarisation (the DMG is currently unsigned, so Gatekeeper will block it)
 - [ ] Linux `.desktop` MIME type registration (`application/xml`, `text/xml`)
 - [ ] AppStream metadata for software-center discovery
 - [ ] macOS `QFileOpenEvent` handling (Finder open, Dock drag)
-- [ ] `libxkbcommon-dev` listed as a build dependency in the README
-      (CMake reports "Could NOT find XKB" during configure)
-- [ ] There is no README
+- [ ] A macOS icon: `Info.plist` has no `CFBundleIconFile`, so the bundle uses
+      the generic application icon
+- [ ] Smoke-test the produced AppImage in CI (it is built and uploaded, but
+      never launched, so a broken bundle would still go green)
+- [ ] There is no README. It should mention that Qt 6.5+ needs `libxcb-cursor0`
+      at runtime on Linux, which is the dependency that broke CI packaging.
