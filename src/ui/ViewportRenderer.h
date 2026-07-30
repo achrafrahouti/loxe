@@ -37,6 +37,9 @@ public:
     uint64_t viewRangeEnd()    const;
 
     uint64_t cursorOffset() const { return m_cursorOffset; }
+    // Topmost rendered line. Exposed so tests can assert that scrolling
+    // actually moved the view.
+    uint64_t firstVisibleLine() const { return m_firstVisibleLine; }
     int      tabWidth()     const { return m_tabWidth; }
     bool     wordWrap()     const { return m_wordWrap; }
     bool     isReadOnly()   const { return m_readOnly; }
@@ -67,6 +70,11 @@ public:
     int cursorColumn() const;
 
     void ensureCursorVisible();
+
+    // Recomputes the scroll bar ranges. Call after the line index has learned
+    // more about the document, otherwise the vertical range can stay stuck at
+    // the estimate taken when the document was attached.
+    void refreshScrollBars();
 
     // --- Editing (no-ops when read-only) ---
     void insertText(const QString& text);
@@ -133,6 +141,9 @@ private:
 
     void scrollToLine(uint64_t line);
     void updateScrollBars();
+    // Rebuilds the scroll range if the index has learned more lines since it
+    // was last computed. Cheap enough to call before every scroll.
+    void syncScrollRangeIfStale();
 
     int gutterWidth() const;
     int textOriginX() const; // gutter width minus horizontal scroll
@@ -175,6 +186,11 @@ private:
 
     uint64_t m_matchStart  = 0;
     uint64_t m_matchLength = 0;
+
+    // Line count the vertical scroll range was last built from. The index
+    // learns as it is queried, so a range computed when the document was merely
+    // attached (estimate: 1 line) has to be refreshed once it knows better.
+    uint64_t m_scrollLineHint = 0;
 
     bool     m_rangeActive = false;
     uint64_t m_rangeStart  = 0;

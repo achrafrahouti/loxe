@@ -9,6 +9,7 @@
 #include "ui/ViewportRenderer.h"
 #include "TestHelpers.h"
 
+#include <atomic>
 #include <memory>
 
 using namespace loxe_test;
@@ -45,6 +46,10 @@ private slots:
 
     void undoRedo_restoresDocumentAndCursor();
     void readOnly_rejectsEdits();
+
+    // Scrolling.
+    void wheelScrolls_onAnAttachedButUnscannedIndex();
+    void wheelScrolls_afterIndexBuild();
 
     // Scoped view ("parse this element only").
     void viewRange_clampsCursorToScope();
@@ -343,6 +348,55 @@ void tst_ViewportEditing::readOnly_rejectsEdits()
 
     QCOMPARE(text(), std::string("<a/>"));
     QVERIFY(!m_table->canUndo());
+}
+
+// --- Scrolling ---
+
+void tst_ViewportEditing::wheelScrolls_onAnAttachedButUnscannedIndex()
+{
+    // attach() leaves the index unscanned, so estimatedLineCount() is 1 until
+    // something walks the document. The scroll bar range must not be frozen at
+    // that estimate, or the wheel silently does nothing while the keyboard —
+    // which moves the view directly — still works.
+    std::string text;
+    for (int i = 0; i < 400; ++i) text += "<line n=\"" + std::to_string(i) + "\"/>\n";
+    setDoc(text);   // index is attached, never built
+
+    QCOMPARE(m_viewport->firstVisibleLine(), uint64_t{0});
+
+    QWheelEvent wheel(QPointF(50, 50), m_viewport->mapToGlobal(QPoint(50, 50)),
+                      QPoint(0, 0), QPoint(0, -120),
+                      Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+    QApplication::sendEvent(m_viewport.get(), &wheel);
+
+    QVERIFY2(m_viewport->firstVisibleLine() > 0,
+             "mouse wheel did not scroll the view");
+}
+
+void tst_ViewportEditing::wheelScrolls_afterIndexBuild()
+{
+    std::string text;
+    for (int i = 0; i < 400; ++i) text += "<line n=\"" + std::to_string(i) + "\"/>\n";
+    setDoc(text);
+
+    std::atomic<bool> cancel{false};
+    m_index->build(*m_table, cancel);
+    m_viewport->refreshScrollBars();
+
+    QWheelEvent wheel(QPointF(50, 50), m_viewport->mapToGlobal(QPoint(50, 50)),
+                      QPoint(0, 0), QPoint(0, -120),
+                      Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+    QApplication::sendEvent(m_viewport.get(), &wheel);
+
+    const uint64_t afterDown = m_viewport->firstVisibleLine();
+    QVERIFY(afterDown > 0);
+
+    // And back up again.
+    QWheelEvent up(QPointF(50, 50), m_viewport->mapToGlobal(QPoint(50, 50)),
+                   QPoint(0, 0), QPoint(0, 120),
+                   Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+    QApplication::sendEvent(m_viewport.get(), &up);
+    QCOMPARE(m_viewport->firstVisibleLine(), uint64_t{0});
 }
 
 // --- Scoped view ---

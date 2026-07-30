@@ -23,7 +23,7 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   under both with leak detection on
 - GitHub Actions CI matrix (ubuntu-22.04 + macos-13)
 - Linux `.desktop` file and macOS `Info.plist` bundle metadata
-- 11 Qt Test binaries, ~220 test functions, all passing
+- 11 Qt Test binaries, ~225 test functions, all passing
 
 ## Engine layer
 
@@ -60,8 +60,11 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - Checkpoint array of `(line, byte_offset)` pairs every ~4 KB
 - Indexes the **PieceTable**, not the raw file, so lookups stay correct after edits
 - Chunked `memchr` scan at 1.5–2.7 GB/s, releasing file pages as it advances
-- `attach()` makes lookups usable before any scanning — this is what lets the
-  viewport paint the first screenful immediately
+- `attach()` makes lookups usable before the full scan — this is what lets the
+  viewport paint the first screenful immediately. It samples the first 64 KB so
+  `estimatedLineCount()` has real data to extrapolate from; an entirely
+  unscanned index reports one line, which sizes the gutter wrongly and leaves
+  the vertical scroll bar with nothing to travel over
 - Checkpoints are sampled **by byte position as well as at newlines**. A minified
   document has no newlines, so newline-only sampling would leave it with no
   checkpoints at all and every lookup would rescan from byte 0
@@ -144,6 +147,10 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   ~65 000 columns per row to display ~125, costing 1.5 s per repaint
 - A line longer than the budget is still **one** line: the remainder is reached
   by scrolling right, not shown as extra rows with invented line numbers
+- Scroll ranges are rebuilt whenever the index has learned more lines, both on
+  paint and before handling a wheel event. Keyboard navigation moves the view
+  directly and so never depended on the range being right, which is why a stale
+  range showed up only as a dead mouse wheel
 - **Scoped view** (`setViewRange`): rendering, navigation, selection and the
   cursor can be restricted to a byte range so a single element is shown on its
   own. Gutter numbers stay absolute, edits still target real document offsets so
@@ -233,6 +240,8 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
     document stays loaded underneath, so Parse never edits the file — saving,
     search, validation and the tree all keep working against the original.
     Capped at 64 MB, since reformatting needs roughly twice the element's size.
+    The preview's line index is scanned up front rather than lazily, so its line
+    count — and therefore its scroll bar — is exact from the first frame.
   - *Show only <name> (raw, editable)*: scopes the viewport to the element's
     live bytes instead, for editing it in isolation
   - *Copy <name> to clipboard*: its full source, with a confirmation above 32 MB

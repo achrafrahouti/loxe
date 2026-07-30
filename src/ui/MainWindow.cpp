@@ -192,7 +192,7 @@ void MainWindow::onFileReady(MmapBuffer* buf, PieceTable* table, SparseLineIndex
 void MainWindow::onIndexReady()
 {
     // Scroll bar range and line count are exact from here on.
-    m_viewport->update();
+    m_viewport->refreshScrollBars();
     statusBar()->showMessage(tr("%1 lines").arg(m_lineIndex->lineCount()), 4000);
 }
 
@@ -631,7 +631,11 @@ void MainWindow::onTreeParseElement()
     m_previewTable = std::move(formatted);
     m_previewTable->clearUndo();
     m_previewIndex = std::make_unique<SparseLineIndex>();
-    m_previewIndex->attach(*m_previewTable);
+    // Scan it now rather than attaching lazily: the preview is capped at 64 MB,
+    // so this is quick, and it means the line count — and therefore the scroll
+    // bar range — is exact from the very first frame.
+    std::atomic<bool> noCancel{false};
+    m_previewIndex->build(*m_previewTable, noCancel);
     m_previewName = name;
 
     m_viewport->setDocument(m_previewTable.get(), m_previewIndex.get());

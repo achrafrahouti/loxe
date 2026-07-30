@@ -18,6 +18,9 @@ class SparseLineIndex {
 public:
     static constexpr uint64_t kCheckpointInterval = 4096;        // bytes between samples
     static constexpr size_t   kScanChunk          = 256 * 1024;  // scan granularity
+    // Bytes attach() samples so estimatedLineCount() has real data to
+    // extrapolate from before the full scan runs.
+    static constexpr uint64_t kAttachProbeBytes   = 64 * 1024;
 
     SparseLineIndex() = default;
 
@@ -27,9 +30,14 @@ public:
                const std::atomic<bool>& cancelled,
                std::function<void(int)> progress = {});
 
-    // Attaches the index to a document without scanning it. Lookups then
-    // extend the checkpoint array lazily, on demand. Used for documents created
-    // in-memory (File > New) and to make the viewport usable during phase 1.
+    // Attaches the index to a document, sampling only its first
+    // kAttachProbeBytes. Lookups then extend the checkpoint array lazily, on
+    // demand. Used for documents created in-memory (File > New) and to make the
+    // viewport usable during phase 1.
+    //
+    // The probe exists so estimatedLineCount() can extrapolate immediately: an
+    // entirely unscanned index reports a single line, which leaves the vertical
+    // scroll bar with nothing to travel over and the mouse wheel inert.
     void attach(const PieceTable& doc);
 
     // Invalidate all checkpoints at and after byte offset (called after edits).

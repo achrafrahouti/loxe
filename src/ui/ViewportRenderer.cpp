@@ -116,6 +116,7 @@ void ViewportRenderer::setDocument(PieceTable* table, SparseLineIndex* index)
     m_rangeActive      = false;
     m_rangeStart       = 0;
     m_rangeEnd         = 0;
+    m_scrollLineHint   = 0;
     m_firstVisibleLine = 0;
     m_cursorOffset     = 0;
     m_selAnchor        = 0;
@@ -362,6 +363,8 @@ void ViewportRenderer::paintEvent(QPaintEvent*)
     if (!m_table || !m_index) return;
 
     rebuildVisibleLines();
+    syncScrollRangeIfStale();
+
     const auto tokens = m_highlighter->tokenise(
         [this] {
             std::vector<QString> texts;
@@ -795,6 +798,10 @@ void ViewportRenderer::mouseDoubleClickEvent(QMouseEvent* e)
 
 void ViewportRenderer::wheelEvent(QWheelEvent* e)
 {
+    // The range may predate anything the index has since learned; without this
+    // the wheel is inert on a document that has not been painted yet.
+    syncScrollRangeIfStale();
+
     const int steps = e->angleDelta().y() / 120;
     if (steps != 0) {
         m_vScroll->setValue(m_vScroll->value() - steps * kWheelLines);
@@ -1119,6 +1126,26 @@ void ViewportRenderer::scrollToLine(uint64_t line)
     // m_firstVisibleLine already matches.
     m_vScroll->setValue(static_cast<int>(std::min<uint64_t>(line, INT32_MAX)));
     update();
+}
+
+void ViewportRenderer::refreshScrollBars()
+{
+    m_scrollLineHint = m_index ? m_index->estimatedLineCount() : 0;
+    updateScrollBars();
+    update();
+}
+
+// The index only learns the document's line count as it is queried, so a range
+// computed while it was merely attached reports one line and the scroll bar has
+// nothing to travel over. Keyboard navigation hid this because scrollToLine()
+// moves the view directly, whereas the wheel drives the scroll bar.
+void ViewportRenderer::syncScrollRangeIfStale()
+{
+    if (!m_index) return;
+    const uint64_t known = m_index->estimatedLineCount();
+    if (known == m_scrollLineHint) return;
+    m_scrollLineHint = known;
+    updateScrollBars();
 }
 
 void ViewportRenderer::updateScrollBars()

@@ -13,13 +13,25 @@ constexpr uint64_t kDropPagesEvery = 8ull * 1024 * 1024;
 
 void SparseLineIndex::attach(const PieceTable& doc)
 {
-    std::unique_lock lock(m_mutex);
-    m_doc      = &doc;
-    m_docBytes = doc.length();
-    m_checkpoints.assign(1, Checkpoint{0, 0, true});
-    m_lastLine = 0;
-    m_scanned  = 0;
-    m_complete = (m_docBytes == 0);
+    uint64_t probeEnd = 0;
+    {
+        std::unique_lock lock(m_mutex);
+        m_doc      = &doc;
+        m_docBytes = doc.length();
+        m_checkpoints.assign(1, Checkpoint{0, 0, true});
+        m_lastLine = 0;
+        m_scanned  = 0;
+        m_complete = (m_docBytes == 0);
+        probeEnd   = std::min(m_docBytes, kAttachProbeBytes);
+    }
+
+    if (probeEnd == 0) return;
+
+    // Sample the head of the document so the line count can be extrapolated
+    // straight away. Deliberately does not mark the index complete even when the
+    // probe covers everything: the full scan still owns that decision.
+    const std::atomic<bool> noCancel{false};
+    scan(doc, 0, probeEnd, 0, noCancel, {});
 }
 
 bool SparseLineIndex::build(const PieceTable&        doc,
