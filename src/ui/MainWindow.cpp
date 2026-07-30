@@ -3,6 +3,7 @@
 #include "FindBar.h"
 #include "ViewportRenderer.h"
 #include "VirtualTreeModel.h"
+#include "Theme.h"
 #include "XmlContext.h"
 #include "../engine/Encoding.h"
 #include "../engine/FormatEngine.h"
@@ -12,6 +13,7 @@
 #include "../engine/SparseLineIndex.h"
 #include "../engine/Validator.h"
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
 #include <QDockWidget>
@@ -448,10 +450,30 @@ void MainWindow::onViewToggleWordWrap()
 void MainWindow::onViewToggleTreePane() { m_treeView->setVisible(!m_treeView->isVisible()); }
 void MainWindow::onViewToggleAttrPane() { m_attrDock->setVisible(!m_attrDock->isVisible()); }
 
-void MainWindow::onViewToggleDarkTheme()
+void MainWindow::onViewThemeChanged()
 {
-    const bool on = m_darkAction->isChecked();
-    m_viewport->setDarkTheme(on);
+    QAction* chosen = m_themeGroup->checkedAction();
+    if (!chosen) return;
+
+    Theme::apply(Theme::fromKey(chosen->data().toString()));
+    applyThemeToWidgets();
+
+    QSettings().setValue("theme", Theme::toKey(Theme::currentMode()));
+}
+
+// The viewport and the tree draw their own colours, so they have to be told
+// what the palette became. Everything else Qt restyles for us.
+void MainWindow::applyThemeToWidgets()
+{
+    const bool dark = Theme::isDark();
+    m_viewport->setDarkTheme(dark);
+
+    // Repaint the tree with the new element colour.
+    if (m_treeView->model()) m_treeView->viewport()->update();
+
+    // The well-formedness label is coloured per outcome, so let the check
+    // re-run and set it rather than trying to recolour it from its text.
+    scheduleValidation();
 }
 
 // --- Sync between panes ---
@@ -973,12 +995,14 @@ void MainWindow::onValidationFinished()
 
     if (result.wellFormed) {
         m_statusValid->setText(QStringLiteral("✔ ") + tr("Well-formed"));
-        m_statusValid->setStyleSheet(QStringLiteral("color: #067d17;"));
+        m_statusValid->setStyleSheet(
+            QStringLiteral("color: %1;").arg(Theme::successColor().name()));
         m_statusValid->setToolTip({});
         return;
     }
 
-    m_statusValid->setStyleSheet(QStringLiteral("color: #cc0000;"));
+    m_statusValid->setStyleSheet(
+        QStringLiteral("color: %1;").arg(Theme::errorColor().name()));
 
     const XmlDiagnostic* first = result.primary();
     if (!first) {
@@ -1072,10 +1096,18 @@ void MainWindow::setupUi()
     m_treeView->setAlternatingRowColors(true);
     m_treeView->header()->setStretchLastSection(true);
 
+    left->setMinimumWidth(200);
     m_splitter->addWidget(left);
     m_splitter->addWidget(m_treeView);
     m_splitter->setStretchFactor(0, 3);
     m_splitter->setStretchFactor(1, 1);
+    // Stretch factors alone only govern *resizing*; the initial split comes from
+    // the children's size hints, and the viewport has none of its own — which
+    // collapsed the editor to zero width on a first run, before any splitter
+    // state had been saved. Give it an explicit starting ratio, and stop either
+    // pane being collapsed away entirely.
+    m_splitter->setChildrenCollapsible(false);
+    m_splitter->setSizes({900, 300});
 
     vbox->addWidget(m_splitter, 1);
     setCentralWidget(central);
@@ -1129,6 +1161,7 @@ void MainWindow::setupMenus()
     m_wordWrapAction = view->addAction(tr("Toggle &Word Wrap"), QKeySequence(Qt::ALT | Qt::Key_Z),
                                        this, &MainWindow::onViewToggleWordWrap);
     m_wordWrapAction->setCheckable(true);
+    // Placeholder replaced below; kept so the ordering stays readable.
     m_wholeDocAction = view->addAction(tr("Show &Whole Document"),
                                        QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_W),
                                        this, &MainWindow::onShowWholeDocument);
@@ -1137,8 +1170,24 @@ void MainWindow::setupMenus()
     view->addAction(tr("Toggle &Tree Pane"),      {}, this, &MainWindow::onViewToggleTreePane);
     view->addAction(tr("Toggle &Attribute Pane"), {}, this, &MainWindow::onViewToggleAttrPane);
     view->addSeparator();
-    m_darkAction = view->addAction(tr("&Dark Theme"), this, &MainWindow::onViewToggleDarkTheme);
-    m_darkAction->setCheckable(true);
+    // A three-way choice rather than an on/off toggle: "System" is what stops a
+    // dark desktop producing a dark window around a light editor.
+    QMenu* themeMenu = view->addMenu(tr("&Theme"));
+    m_themeGroup = new QActionGroup(this);
+    m_themeGroup->setExclusive(true);
+
+    const struct { const char* label; Theme::Mode mode; } kThemes[] = {
+        {QT_TR_NOOP("&System"), Theme::Mode::System},
+        {QT_TR_NOOP("&Light"),  Theme::Mode::Light},
+        {QT_TR_NOOP("&Dark"),   Theme::Mode::Dark},
+    };
+    for (const auto& entry : kThemes) {
+        QAction* action = themeMenu->addAction(tr(entry.label));
+        action->setCheckable(true);
+        action->setData(Theme::toKey(entry.mode));
+        m_themeGroup->addAction(action);
+        connect(action, &QAction::triggered, this, &MainWindow::onViewThemeChanged);
+    }
 }
 
 void MainWindow::setupStatusBar()
@@ -1244,7 +1293,7 @@ void MainWindow::saveSession()
     s.setValue("windowState", saveState());
     s.setValue("splitter",    m_splitter->saveState());
     s.setValue("recentFiles", m_recentFiles);
-    s.setValue("darkTheme",   m_darkAction->isChecked());
+    s.setValue("theme",       Theme::toKey(Theme::currentMode()));
     s.setValue("wordWrap",    m_viewport->wordWrap());
     s.setValue("lastFile",    m_currentPath);
 }
@@ -1259,10 +1308,16 @@ void MainWindow::restoreSession()
     m_recentFiles = s.value("recentFiles").toStringList();
     rebuildRecentFileMenu();
 
-    if (s.value("darkTheme").toBool()) {
-        m_darkAction->setChecked(true);
-        m_viewport->setDarkTheme(true);
+    // main() has already applied the saved theme, before any window appeared;
+    // here we only reflect it in the menu and in the self-painting widgets.
+    const Theme::Mode mode = Theme::currentMode();
+    for (QAction* action : m_themeGroup->actions()) {
+        if (Theme::fromKey(action->data().toString()) == mode) {
+            action->setChecked(true);
+            break;
+        }
     }
+    applyThemeToWidgets();
     if (s.value("wordWrap").toBool()) {
         m_wordWrapAction->setChecked(true);
         m_viewport->setWordWrap(true);

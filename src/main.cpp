@@ -1,9 +1,11 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QMetaType>
+#include <QSettings>
 #include <QTimer>
 
 #include "ui/MainWindow.h"
+#include "ui/Theme.h"
 #include "ui/AsyncLoader.h"
 #include "ui/VirtualTreeModel.h"
 #include "engine/MmapBuffer.h"
@@ -23,6 +25,21 @@ int main(int argc, char* argv[])
     app.setApplicationVersion("0.1.0");
     app.setOrganizationName("loxe");
     app.setOrganizationDomain("loxe.app");
+
+    // Theme before any window exists, so the first frame is already consistent.
+    // Applying it later is what produced a dark shell around a light editor.
+    Theme::initialize(app);
+    {
+        QSettings settings;
+        QString key = settings.value("theme").toString();
+        if (key.isEmpty()) {
+            // Migrate the old on/off setting.
+            key = settings.value("darkTheme").toBool()
+                ? Theme::toKey(Theme::Mode::Dark)
+                : Theme::toKey(Theme::Mode::System);
+        }
+        Theme::apply(Theme::fromKey(key));
+    }
 
     QCommandLineParser parser;
     parser.setApplicationDescription("High-performance XML editor");

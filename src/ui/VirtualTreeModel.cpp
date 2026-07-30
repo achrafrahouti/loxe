@@ -3,6 +3,8 @@
 #include "../engine/XmlScanner.h"
 
 #include <QColor>
+#include <QGuiApplication>
+#include <QPalette>
 #include <QStringList>
 
 #include <algorithm>
@@ -291,8 +293,14 @@ QVariant VirtualTreeModel::data(const QModelIndex& index, int role) const
     }
     if (role == Qt::ToolTipRole)
         return QStringLiteral("<%1> at byte %2").arg(node.tagName).arg(node.byteOffset);
-    if (role == Qt::ForegroundRole && index.column() == 0)
-        return QColor(0x00, 0x55, 0xAA);
+    if (role == Qt::ForegroundRole && index.column() == 0) {
+        // Follows the palette rather than a fixed blue, which is unreadable on
+        // a dark background. Checked here instead of cached so a theme switch
+        // needs nothing more than a repaint.
+        const bool dark =
+            QGuiApplication::palette().color(QPalette::Window).lightness() < 128;
+        return dark ? QColor(0x6C, 0xB6, 0xFF) : QColor(0x00, 0x55, 0xAA);
+    }
     return {};
 }
 

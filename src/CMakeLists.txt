@@ -18,6 +18,7 @@ qt_add_executable(loxe
     ui/FindBar.cpp
     ui/IncrementalHighlighter.cpp
     ui/MainWindow.cpp
+    ui/Theme.cpp
     ui/ViewportRenderer.cpp
     ui/VirtualTreeModel.cpp
     ui/XmlContext.cpp

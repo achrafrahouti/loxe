@@ -17,6 +17,7 @@ class MmapBuffer;
 class PieceTable;
 class SparseLineIndex;
 class QAction;
+class QActionGroup;
 class QDockWidget;
 class QFileSystemWatcher;
 class QLabel;
@@ -65,7 +66,7 @@ private slots:
     void onViewToggleWordWrap();
     void onViewToggleTreePane();
     void onViewToggleAttrPane();
-    void onViewToggleDarkTheme();
+    void onViewThemeChanged();
 
     // AsyncLoader signals
     void onFileReady(MmapBuffer* buf, PieceTable* table, SparseLineIndex* index);
@@ -134,6 +135,8 @@ private:
     void scheduleValidation();
     void cancelValidation();
     void watchCurrentFile();
+    // Pushes the active palette into the widgets that paint themselves.
+    void applyThemeToWidgets();
 
     // Locates `term` from `from`; returns false when there is no match.
     bool findFrom(uint64_t from, bool backwards, bool moveCursor = true);
@@ -167,7 +170,7 @@ private:
     QAction* m_redoAction     = nullptr;
     QAction* m_wordWrapAction = nullptr;
     QAction* m_wholeDocAction  = nullptr;
-    QAction* m_darkAction     = nullptr;
+    QActionGroup* m_themeGroup = nullptr;
     QMenu*   m_recentMenu     = nullptr;
 
     AsyncLoader*        m_loader        = nullptr;

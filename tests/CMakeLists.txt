@@ -40,6 +40,19 @@ endfunction()
 
 add_loxe_ui_test(tst_ViewportEditing)
 
+# Theme drives the application palette, so it needs a real QApplication.
+qt_add_executable(tst_Theme
+    tst_Theme.cpp
+    ${CMAKE_SOURCE_DIR}/src/ui/Theme.cpp
+)
+target_include_directories(tst_Theme PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(tst_Theme PRIVATE Qt6::Test Qt6::Widgets)
+add_test(NAME tst_Theme COMMAND tst_Theme)
+set_tests_properties(tst_Theme PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 # VirtualTreeModel is a QAbstractItemModel: QtCore plus QtGui for QColor.
 qt_add_executable(tst_VirtualTreeModel
     tst_VirtualTreeModel.cpp

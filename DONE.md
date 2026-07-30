@@ -23,7 +23,7 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   under both with leak detection on
 - GitHub Actions CI matrix (ubuntu-22.04 + macos-13)
 - Linux `.desktop` file and macOS `Info.plist` bundle metadata
-- 11 Qt Test binaries, ~225 test functions, all passing
+- 12 Qt Test binaries, ~235 test functions, all passing
 
 ## Engine layer
 
@@ -191,6 +191,24 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   close it early
 - `xpathFor()` builds a location path, adding positional predicates only where
   a name repeats among siblings (`/orders/order[3]/total`)
+
+### Theme (new)
+- One application-wide palette drives the whole window. Previously "dark theme"
+  only repainted the viewport, so the tree, docks, menus and status bar kept the
+  desktop's colours — and a dark desktop produced a dark shell around a light
+  editor before anything was even toggled
+- Three modes: **System** (restores the style and palette the platform started
+  with), **Light** and **Dark**, replacing the old on/off checkbox
+- Light and Dark force the Fusion style: platform styles, notably the GTK one,
+  ignore most `QPalette` roles, so an explicit palette would be silently dropped
+  and only the viewport would change
+- `isDark()` judges the palette actually in force rather than the requested
+  mode, so under System the viewport follows whatever the desktop chose
+- Applied in `main()` before any window is constructed, so the first frame is
+  already consistent
+- Status and tree colours come from the theme; all meet a 3:1 contrast ratio
+  against their background in both modes, asserted by `tst_Theme`
+- The legacy `darkTheme=true` setting migrates to Dark on first run
 
 ### XmlContext (new)
 - Recovers the chain of elements enclosing a byte offset, feeding the breadcrumb

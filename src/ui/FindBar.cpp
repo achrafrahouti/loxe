@@ -1,4 +1,5 @@
 #include "FindBar.h"
+#include "Theme.h"
 
 #include <QCheckBox>
 #include <QHBoxLayout>
@@ -106,7 +107,9 @@ void FindBar::activate(bool withReplace, const QString& seed)
 void FindBar::setStatus(const QString& text, bool notFound)
 {
     m_status->setText(text);
-    m_status->setStyleSheet(notFound ? QStringLiteral("color: #cc0000;") : QString());
+    m_status->setStyleSheet(
+        notFound ? QStringLiteral("color: %1;").arg(Theme::errorColor().name())
+                 : QString());
 }
 
 void FindBar::keyPressEvent(QKeyEvent* e)

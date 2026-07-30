@@ -96,6 +96,8 @@ are not "fixed" by accident.
 - [ ] Fuzz target via libFuzzer
 
 ### MainWindow
+- [ ] Syntax-highlight colours are two fixed palettes; they do not follow a
+      custom system accent or a user-chosen scheme
 - [ ] Tree context menu: add *Delete element* and *Copy element without children*
 - [ ] A parsed preview is read-only. Editing it would need the formatted text
       mapped back to the original byte range — worth doing as "reformat this
@@ -139,7 +141,10 @@ are not "fixed" by accident.
 - [ ] Per-file state: scroll position, cursor, bookmarks, word wrap
 - [ ] Preferences dialog (Ctrl+,): font, indent style, colour theme, column
       markers, auto-close, recent file count, large-file save strategy
-- [ ] Follow the system light/dark setting (manual toggle exists)
+- [x] System / Light / Dark theme applied application-wide, persisted
+- [ ] React to the desktop switching light/dark while running (Qt 6.5 has
+      `QStyleHints::colorSchemeChanged`; under System the app currently picks up
+      the desktop's scheme only at startup)
 - [ ] Crash recovery: auto-save every 60 s, offer at next launch (REL-05)
 
 ### File I/O (FIO-*)
