@@ -188,29 +188,40 @@ std::vector<TreeNode> VirtualTreeModel::scanRoots(const PieceTable& doc,
     root.isLoaded    = true;
     nodes.push_back(std::move(root));
 
-    // Append the children and wire the sibling chain.
-    const int base = 1;
-    for (size_t i = 0; i < scan.children.size(); ++i) {
-        nodes.push_back(std::move(scan.children[i]));
-        if (i == 0) nodes[0].firstChild = base;
-        else        nodes[base + static_cast<int>(i) - 1].nextSibling = base + static_cast<int>(i);
+    // Append the children as one contiguous block directly after the root.
+    if (!scan.children.empty()) {
+        nodes[0].firstChild = 1;
+        nodes[0].childCount = static_cast<int>(scan.children.size());
+        for (auto& child : scan.children) nodes.push_back(std::move(child));
     }
     return nodes;
+}
+
+void VirtualTreeModel::rebuildRoots()
+{
+    m_roots.clear();
+    for (int i = 0; i < static_cast<int>(m_nodes.size()); ++i)
+        if (m_nodes[i].parentIndex == -1) m_roots.push_back(i);
 }
 
 void VirtualTreeModel::setInitialNodes(std::vector<TreeNode> nodes)
 {
     beginResetModel();
     m_nodes = std::move(nodes);
+    rebuildRoots();
     endResetModel();
 }
 
 void VirtualTreeModel::appendRootNodes(std::vector<TreeNode> nodes)
 {
     if (nodes.empty()) return;
-    beginInsertRows({}, static_cast<int>(m_nodes.size()),
-                    static_cast<int>(m_nodes.size() + nodes.size() - 1));
-    for (auto& n : nodes) m_nodes.push_back(std::move(n));
+    beginInsertRows({}, static_cast<int>(m_roots.size()),
+                    static_cast<int>(m_roots.size() + nodes.size() - 1));
+    for (auto& n : nodes) {
+        n.parentIndex = -1;
+        m_roots.push_back(static_cast<int>(m_nodes.size()));
+        m_nodes.push_back(std::move(n));
+    }
     endInsertRows();
 }
 
@@ -222,26 +233,16 @@ QModelIndex VirtualTreeModel::index(int row, int column,
     if (!hasIndex(row, column, parent)) return {};
 
     if (!parent.isValid()) {
-        // Root items: the row-th node with parentIndex == -1.
-        int count = 0;
-        for (int i = 0; i < static_cast<int>(m_nodes.size()); ++i) {
-            if (m_nodes[i].parentIndex == -1) {
-                if (count == row) return createIndex(row, column, i);
-                ++count;
-            }
-        }
-        return {};
+        if (row >= static_cast<int>(m_roots.size())) return {};
+        return createIndex(row, column, m_roots[static_cast<size_t>(row)]);
     }
 
-    // Child items: walk the firstChild → nextSibling chain.
-    const int pni      = nodeIndexOf(parent);
-    int       childIdx = m_nodes[pni].firstChild;
-    for (int i = 0; i < row; ++i) {
-        if (childIdx == -1) return {};
-        childIdx = m_nodes[childIdx].nextSibling;
-    }
-    if (childIdx == -1) return {};
-    return createIndex(row, column, childIdx);
+    // Children are contiguous, so the row is a direct offset.
+    const int pni = nodeIndexOf(parent);
+    if (pni < 0 || pni >= static_cast<int>(m_nodes.size())) return {};
+    const TreeNode& p = m_nodes[pni];
+    if (p.firstChild < 0 || row >= p.childCount) return {};
+    return createIndex(row, column, p.firstChild + row);
 }
 
 QModelIndex VirtualTreeModel::parent(const QModelIndex& child) const
@@ -256,20 +257,12 @@ QModelIndex VirtualTreeModel::parent(const QModelIndex& child) const
 
 int VirtualTreeModel::rowCount(const QModelIndex& parent) const
 {
-    if (!parent.isValid()) {
-        int count = 0;
-        for (const auto& n : m_nodes)
-            if (n.parentIndex == -1) ++count;
-        return count;
-    }
+    if (!parent.isValid()) return static_cast<int>(m_roots.size());
+
     const int nodeIdx = nodeIndexOf(parent);
     if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return 0;
     if (!m_nodes[nodeIdx].isLoaded) return 0;
-
-    int count = 0;
-    int child = m_nodes[nodeIdx].firstChild;
-    while (child != -1) { ++count; child = m_nodes[child].nextSibling; }
-    return count;
+    return m_nodes[nodeIdx].childCount;
 }
 
 int VirtualTreeModel::columnCount(const QModelIndex&) const { return 3; }
@@ -413,17 +406,21 @@ QString VirtualTreeModel::xpathFor(const QModelIndex& index) const
         int position = 1;
         int sameName = 0;
         const int parentIdx = node.parentIndex;
-        int sib = (parentIdx < 0)
-            ? firstRootNode()
-            : m_nodes[parentIdx].firstChild;
         bool beforeSelf = true;
-        while (sib != -1) {
+
+        auto visit = [&](int sib) {
             if (m_nodes[sib].tagName == node.tagName) {
                 ++sameName;
                 if (beforeSelf && sib != nodeIdx) ++position;
             }
             if (sib == nodeIdx) beforeSelf = false;
-            sib = (parentIdx < 0) ? nextRootNode(sib) : m_nodes[sib].nextSibling;
+        };
+
+        if (parentIdx < 0) {
+            for (int sib : m_roots) visit(sib);
+        } else {
+            const TreeNode& p = m_nodes[parentIdx];
+            for (int i = 0; i < p.childCount; ++i) visit(p.firstChild + i);
         }
 
         parts.prepend(sameName > 1
@@ -433,20 +430,6 @@ QString VirtualTreeModel::xpathFor(const QModelIndex& index) const
     }
 
     return QStringLiteral("/") + parts.join(QLatin1Char('/'));
-}
-
-int VirtualTreeModel::firstRootNode() const
-{
-    for (int i = 0; i < static_cast<int>(m_nodes.size()); ++i)
-        if (m_nodes[i].parentIndex == -1) return i;
-    return -1;
-}
-
-int VirtualTreeModel::nextRootNode(int from) const
-{
-    for (int i = from + 1; i < static_cast<int>(m_nodes.size()); ++i)
-        if (m_nodes[i].parentIndex == -1) return i;
-    return -1;
 }
 
 QModelIndex VirtualTreeModel::indexForOffset(uint64_t offset) const
@@ -489,13 +472,14 @@ void VirtualTreeModel::loadChildren(int nodeIndex)
     const QModelIndex parentQIdx = createIndex(rowOfNode(nodeIndex), 0, nodeIndex);
     beginInsertRows(parentQIdx, 0, static_cast<int>(batch.size()) - 1);
 
+    // One contiguous block, so the children are addressable by offset from
+    // firstChild for the rest of the model's life.
     const int base = static_cast<int>(m_nodes.size());
-    for (int i = 0; i < static_cast<int>(batch.size()); ++i) {
-        m_nodes.push_back(std::move(batch[static_cast<size_t>(i)]));
-        if (i == 0) m_nodes[nodeIndex].firstChild = base;
-        else        m_nodes[base + i - 1].nextSibling = base + i;
-    }
-    m_nodes[nodeIndex].isLoaded = true;
+    m_nodes.reserve(m_nodes.size() + batch.size());
+    for (auto& child : batch) m_nodes.push_back(std::move(child));
+    m_nodes[nodeIndex].firstChild = base;
+    m_nodes[nodeIndex].childCount = static_cast<int>(batch.size());
+    m_nodes[nodeIndex].isLoaded   = true;
 
     endInsertRows();
 }
@@ -508,16 +492,9 @@ int VirtualTreeModel::nodeIndexOf(const QModelIndex& idx) const
 int VirtualTreeModel::rowOfNode(int nodeIdx) const
 {
     const int parentIdx = m_nodes[nodeIdx].parentIndex;
-    int row = 0;
-    if (parentIdx < 0) {
-        for (int i = 0; i < nodeIdx; ++i)
-            if (m_nodes[i].parentIndex == -1) ++row;
-    } else {
-        int sib = m_nodes[parentIdx].firstChild;
-        while (sib != -1 && sib != nodeIdx) {
-            ++row;
-            sib = m_nodes[sib].nextSibling;
-        }
-    }
-    return row;
+    if (parentIdx >= 0) return nodeIdx - m_nodes[parentIdx].firstChild;
+
+    for (int i = 0; i < static_cast<int>(m_roots.size()); ++i)
+        if (m_roots[static_cast<size_t>(i)] == nodeIdx) return i;
+    return 0;
 }

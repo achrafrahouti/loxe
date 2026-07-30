@@ -37,7 +37,11 @@ std::string_view trimmed(std::string_view s)
 class Layout {
 public:
     Layout(const FormatEngine::Options& opts, const FormatEngine::SinkFn& sink)
-        : m_opts(opts), m_sink(sink), m_beautify(opts.mode == FormatEngine::Mode::Beautify)
+        : m_opts(opts), m_sink(sink), m_beautify(opts.mode == FormatEngine::Mode::Beautify),
+          m_indentChar(opts.indentStyle == FormatEngine::IndentStyle::Tabs ? '\t' : ' '),
+          m_indentUnit(opts.indentStyle == FormatEngine::IndentStyle::Tabs
+                           ? size_t{1}
+                           : static_cast<size_t>(std::max(0, opts.indentWidth)))
     {
         m_out.reserve(64 * 1024);
     }
@@ -113,13 +117,15 @@ private:
         return ok;
     }
 
-    std::string indent(int depth) const
+    // Indentation is one uniform character, so a single grown-on-demand buffer
+    // serves every depth. Returning a std::string by value here meant building
+    // one per node — tens of millions of them on a dense document.
+    std::string_view indent(int depth)
     {
         if (depth <= 0) return {};
-        const auto d = static_cast<size_t>(depth);
-        return m_opts.indentStyle == FormatEngine::IndentStyle::Tabs
-            ? std::string(d, '\t')
-            : std::string(d * static_cast<size_t>(std::max(0, m_opts.indentWidth)), ' ');
+        const size_t need = static_cast<size_t>(depth) * m_indentUnit;
+        if (m_indentCache.size() < need) m_indentCache.resize(need, m_indentChar);
+        return std::string_view(m_indentCache).substr(0, need);
     }
 
     // Starts a node on a fresh line at the given depth.
@@ -142,6 +148,13 @@ private:
         // already hold buffered text is a continuation of the same node and can
         // no longer be treated as collapsible whitespace.
         if (m_textStreaming) return emit(raw);
+
+        // Beautify discards inter-node whitespace, and in an already-indented
+        // document that is most text nodes. Recognising it here avoids copying
+        // it into the buffer only for flushText() to throw it away. Minify has
+        // to keep buffering: there, leading whitespace survives if the run turns
+        // out to hold anything significant.
+        if (m_beautify && m_pendingText.empty() && allSpace(raw)) return true;
 
         if (m_pendingText.size() + raw.size() > kTextBufferCap) {
             if (!commitPendingAsSignificant()) return false;
@@ -203,6 +216,10 @@ private:
     const FormatEngine::Options& m_opts;
     const FormatEngine::SinkFn&  m_sink;
     const bool                   m_beautify;
+
+    const char         m_indentChar;
+    const size_t       m_indentUnit;
+    std::string        m_indentCache;
 
     std::string        m_out;
     std::string        m_pendingText;

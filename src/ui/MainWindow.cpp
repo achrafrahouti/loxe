@@ -913,15 +913,11 @@ void MainWindow::onReplaceAll()
     opts.wrapAround    = false;
 
     // Collect every match first, then rewrite back-to-front so earlier offsets
-    // stay valid, all inside one undo group (SRC-09).
+    // stay valid, all inside one undo group (SRC-09). One streaming pass: a
+    // findForward() per match re-reads a 1 MB window each time.
     std::vector<uint64_t> hits;
-    uint64_t at = 0;
-    while (true) {
-        const uint64_t hit = SearchEngine::findForward(*m_pieceTable, sv, at, opts);
-        if (hit == SearchEngine::kNotFound) break;
-        hits.push_back(hit);
-        at = hit + needle.size();
-    }
+    SearchEngine::forEachMatch(*m_pieceTable, sv, 0, opts, nullptr,
+                               [&hits](uint64_t at) { hits.push_back(at); return true; });
     if (hits.empty()) { m_findBar->setStatus(tr("No match"), true); return; }
 
     m_pieceTable->beginUndoGroup();

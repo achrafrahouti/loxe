@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -26,6 +27,19 @@ public:
     static constexpr size_t   kWindow   = 1024 * 1024;
 
     using Options = SearchOptions;
+
+    // Receives each match's byte offset in ascending order. Return false to stop.
+    using MatchFn = std::function<bool(uint64_t offset)>;
+
+    // Every non-overlapping match at or after `from`, in one pass over the
+    // document. Callers that want more than one hit must use this rather than
+    // re-entering findForward() from the previous match: each such call rescans
+    // a whole window, which turns "all matches" into a quadratic operation.
+    // Ignores opts.wrapAround.
+    static void forEachMatch(const PieceTable& doc, std::string_view needle,
+                             uint64_t from, const Options& opts,
+                             const std::atomic<bool>* cancelled,
+                             const MatchFn& cb);
 
     // First match at or after `from`. Returns kNotFound if there is none.
     static uint64_t findForward(const PieceTable& doc, std::string_view needle,
