@@ -24,6 +24,9 @@ constexpr int kContextLines = 10;
 
 constexpr int kWheelLines = 3;
 
+// Extra columns decoded beyond the viewport so small scrolls are free.
+constexpr int kColumnSlack = 256;
+
 // Length in bytes of the UTF-8 sequence introduced by lead byte c.
 int utf8SeqLen(unsigned char c)
 {
@@ -392,8 +395,20 @@ void ViewportRenderer::paintEvent(QPaintEvent*)
         // Tokens, clipped to the text area so long lines do not spill into the gutter.
         p.save();
         p.setClipRect(clipX, top, width() - clipX, m_lineHeight);
+        // Only tokens intersecting the visible column window are worth
+        // drawing; a long line is mostly off-screen and shaping it is the
+        // single most expensive thing this widget does.
+        const int firstCol = m_hScroll->value();
+        const int lastCol  = firstCol + visibleColumns() + 1;
+
         if (i < tokens.size() && !tokens[i].empty()) {
             for (const auto& tok : tokens[i]) {
+                const int tokStart = unitToCell[static_cast<size_t>(
+                    std::min<int>(tok.start, line.text.size()))];
+                const int tokEnd = unitToCell[static_cast<size_t>(
+                    std::min<int>(tok.start + tok.length, line.text.size()))];
+                if (tokEnd < firstCol || tokStart > lastCol) continue;
+
                 p.setPen(m_highlighter->colorFor(tok.kind));
                 // Split each token at tabs: tabs advance the cell grid but paint nothing.
                 int u = tok.start;
@@ -753,6 +768,69 @@ void ViewportRenderer::invalidateLines()
     m_linesValid = false;
 }
 
+ViewportRenderer::VisualLine ViewportRenderer::decodeLineAt(uint64_t start,
+                                                            int cellBudget) const
+{
+    VisualLine line;
+    line.startOffset = start;
+
+    if (!m_table) {
+        line.unitToByte.push_back(0);
+        return line;
+    }
+
+    const uint64_t docLen = documentLength();
+
+    // A cell is at least one byte, so budgeting in bytes never under-reads; the
+    // x4 covers the worst case of every cell being a 4-byte UTF-8 sequence.
+    const size_t maxBytes = static_cast<size_t>(std::max(1, cellBudget)) * 4 + 64;
+
+    std::string raw;
+    uint64_t    pos        = start;
+    bool        sawNewline = false;
+    while (pos < docLen && raw.size() < maxBytes) {
+        std::string chunk = m_table->read(pos, 8192);
+        if (chunk.empty()) break;
+        const size_t nl = chunk.find('\n');
+        if (nl != std::string::npos) {
+            raw.append(chunk, 0, nl);
+            sawNewline = true;
+            break;
+        }
+        raw.append(chunk);
+        pos += chunk.size();
+    }
+
+    // Ran out of budget before finding the newline: this is a long line and we
+    // only materialise the slice the viewport can actually show.
+    if (!sawNewline && raw.size() >= maxBytes) {
+        raw.resize(maxBytes);
+        line.clipped = true;
+    }
+
+    line.byteLength = raw.size();
+    if (!raw.empty() && raw.back() == '\r') {
+        // A trailing CR belongs to the line terminator, not the content.
+        raw.pop_back();
+    }
+
+    // Decode UTF-8 while recording where each UTF-16 unit started.
+    line.text.reserve(static_cast<int>(raw.size()));
+    line.unitToByte.reserve(raw.size() + 1);
+    for (size_t b = 0; b < raw.size();) {
+        int len = utf8SeqLen(static_cast<unsigned char>(raw[b]));
+        if (b + static_cast<size_t>(len) > raw.size()) len = 1;
+        QString ch = QString::fromUtf8(raw.data() + b, len);
+        if (ch.isEmpty()) ch = QChar(QChar::ReplacementCharacter);
+        for (int k = 0; k < ch.size(); ++k)
+            line.unitToByte.push_back(static_cast<int>(b));
+        line.text += ch;
+        b += static_cast<size_t>(len);
+    }
+    line.unitToByte.push_back(static_cast<int>(line.byteLength));
+    return line;
+}
+
 void ViewportRenderer::rebuildVisibleLines()
 {
     if (m_linesValid) return;
@@ -760,62 +838,22 @@ void ViewportRenderer::rebuildVisibleLines()
     if (!m_table || !m_index) { m_linesValid = true; return; }
 
     const int      count  = visibleLineCount();
+    const int      budget = lineCellBudget();
     const uint64_t docLen = documentLength();
+    const uint64_t lastLine = m_index->offsetToLine(docLen);
     m_lines.reserve(static_cast<size_t>(count));
 
-    uint64_t offset = m_index->lineToOffset(m_firstVisibleLine);
+    // Walk by line number rather than by "where the previous read stopped". A
+    // clipped line is still a single line, so its remainder must not be shown
+    // as extra rows with invented line numbers.
     for (int i = 0; i < count; ++i) {
-        if (i > 0 && offset >= docLen) break; // past end of document
+        const uint64_t lineNum = m_firstVisibleLine + static_cast<uint64_t>(i);
+        if (lineNum > lastLine) break;
 
-        VisualLine line;
-        line.startOffset = offset;
+        const uint64_t start = m_index->lineToOffset(lineNum);
+        if (start > docLen) break;
 
-        // Read forward in bounded chunks until the newline is found.
-        std::string raw;
-        uint64_t    pos = offset;
-        while (pos < docLen) {
-            std::string chunk = m_table->read(pos, 8192);
-            if (chunk.empty()) break;
-            const size_t nl = chunk.find('\n');
-            if (nl != std::string::npos) {
-                raw.append(chunk, 0, nl);
-                pos += nl + 1;
-                break;
-            }
-            raw.append(chunk);
-            pos += chunk.size();
-            // Guard against pathologically long lines: the viewport cannot show
-            // more than a few thousand columns anyway.
-            if (raw.size() > 64 * 1024) break;
-        }
-
-        line.byteLength = raw.size();
-        if (!raw.empty() && raw.back() == '\r') {
-            // Trailing CR belongs to the line terminator, not the content.
-            raw.pop_back();
-        }
-
-        // Decode UTF-8 while recording where each UTF-16 unit started.
-        line.text.reserve(static_cast<int>(raw.size()));
-        line.unitToByte.reserve(raw.size() + 1);
-        for (size_t b = 0; b < raw.size();) {
-            int len = utf8SeqLen(static_cast<unsigned char>(raw[b]));
-            if (b + static_cast<size_t>(len) > raw.size()) len = 1;
-            QString ch = QString::fromUtf8(raw.data() + b, len);
-            if (ch.isEmpty()) ch = QChar(QChar::ReplacementCharacter);
-            for (int k = 0; k < ch.size(); ++k)
-                line.unitToByte.push_back(static_cast<int>(b));
-            line.text += ch;
-            b += static_cast<size_t>(len);
-        }
-        line.unitToByte.push_back(static_cast<int>(line.byteLength));
-
-        m_lines.push_back(std::move(line));
-        offset = pos;
-        if (pos >= docLen) {
-            // A trailing newline means there is one more (empty) line after it.
-            if (!(docLen > 0 && m_table->read(docLen - 1, 1) == "\n")) break;
-        }
+        m_lines.push_back(decodeLineAt(start, budget));
     }
 
     m_linesValid = true;
@@ -834,28 +872,7 @@ ViewportRenderer::VisualLine ViewportRenderer::buildLine(uint64_t lineNumber) co
         line.unitToByte.push_back(0);
         return line;
     }
-
-    const uint64_t start = m_index->lineToOffset(lineNumber);
-    const uint64_t end   = m_index->lineEndOffset(lineNumber);
-    line.startOffset     = start;
-
-    std::string raw = (end > start) ? m_table->read(start, std::min<uint64_t>(end - start, 64 * 1024))
-                                    : std::string();
-    line.byteLength = raw.size();
-    if (!raw.empty() && raw.back() == '\r') raw.pop_back();
-
-    for (size_t b = 0; b < raw.size();) {
-        int len = utf8SeqLen(static_cast<unsigned char>(raw[b]));
-        if (b + static_cast<size_t>(len) > raw.size()) len = 1;
-        QString ch = QString::fromUtf8(raw.data() + b, len);
-        if (ch.isEmpty()) ch = QChar(QChar::ReplacementCharacter);
-        for (int k = 0; k < ch.size(); ++k)
-            line.unitToByte.push_back(static_cast<int>(b));
-        line.text += ch;
-        b += static_cast<size_t>(len);
-    }
-    line.unitToByte.push_back(static_cast<int>(line.byteLength));
-    return line;
+    return decodeLineAt(m_index->lineToOffset(lineNumber), lineCellBudget());
 }
 
 std::vector<QString> ViewportRenderer::contextLines() const
@@ -872,6 +889,24 @@ std::vector<QString> ViewportRenderer::contextLines() const
 }
 
 // --- Geometry ---
+
+int ViewportRenderer::visibleColumns() const
+{
+    int cw = m_charWidth;
+    if (cw <= 0) {
+        const QFontMetrics fm(m_font);
+        cw = std::max(1, fm.horizontalAdvance(QLatin1Char('0')));
+    }
+    return std::max(16, (width() - gutterWidth()) / cw);
+}
+
+int ViewportRenderer::lineCellBudget() const
+{
+    // Only what the viewport can show, plus slack so a small horizontal scroll
+    // does not force a re-read. Without this a minified document would decode
+    // and tokenise ~65 000 columns per row to display ~125 of them.
+    return m_hScroll->value() + visibleColumns() + kColumnSlack;
+}
 
 int ViewportRenderer::gutterWidth() const
 {

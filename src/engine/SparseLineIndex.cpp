@@ -16,7 +16,7 @@ void SparseLineIndex::attach(const PieceTable& doc)
     std::unique_lock lock(m_mutex);
     m_doc      = &doc;
     m_docBytes = doc.length();
-    m_checkpoints.assign(1, Checkpoint{0, 0});
+    m_checkpoints.assign(1, Checkpoint{0, 0, true});
     m_lastLine = 0;
     m_scanned  = 0;
     m_complete = (m_docBytes == 0);
@@ -30,7 +30,7 @@ bool SparseLineIndex::build(const PieceTable&        doc,
         std::unique_lock lock(m_mutex);
         m_doc      = &doc;
         m_docBytes = doc.length();
-        m_checkpoints.assign(1, Checkpoint{0, 0}); // line 0 starts at byte 0
+        m_checkpoints.assign(1, Checkpoint{0, 0, true}); // line 0 starts at byte 0
         m_lastLine = 0;
         m_scanned  = 0;
         m_complete = false;
@@ -78,13 +78,18 @@ uint64_t SparseLineIndex::scan(const PieceTable& doc, uint64_t from, uint64_t to
             ++line;
             const uint64_t off = pos + static_cast<uint64_t>(nl - base) + 1;
             if (off >= nextSample) {
-                pending.push_back({line, off});
+                pending.push_back({line, off, true});
                 nextSample = off + kCheckpointInterval;
             }
             p = nl + 1;
         }
 
         pos += got;
+
+        // A chunk with no newline in it leaves no checkpoint behind, so a
+        // minified document would end up with none at all and every lookup
+        // would rescan from byte 0. Sample by position as well.
+        if (pending.empty()) pending.push_back({line, pos, false});
 
         {
             std::unique_lock lock(m_mutex);
@@ -117,7 +122,7 @@ void SparseLineIndex::invalidateFrom(uint64_t byteOffset)
     if (it != m_checkpoints.end())
         m_checkpoints.erase(it, m_checkpoints.end());
     if (m_checkpoints.empty())
-        m_checkpoints.push_back({0, 0});
+        m_checkpoints.push_back({0, 0, true});
 
     m_lastLine = m_checkpoints.back().line;
     m_scanned  = m_checkpoints.back().offset;
@@ -182,19 +187,22 @@ void SparseLineIndex::extendTo(uint64_t targetOffset, uint64_t targetLine) const
         const char* const base = buf.data();
         const char* const end  = base + got;
         const char*       p    = base;
+        bool              sampled = false;
         while (p < end) {
             const char* nl = static_cast<const char*>(::memchr(p, '\n', static_cast<size_t>(end - p)));
             if (!nl) break;
             ++line;
             const uint64_t off = pos + static_cast<uint64_t>(nl - base) + 1;
             if (off >= nextSample) {
-                m_checkpoints.push_back({line, off});
+                m_checkpoints.push_back({line, off, true});
                 nextSample = off + kCheckpointInterval;
+                sampled = true;
             }
             p = nl + 1;
         }
 
         pos += got;
+        if (!sampled) m_checkpoints.push_back({line, pos, false});
         m_lastLine = line;
         m_scanned  = pos;
 
@@ -235,9 +243,24 @@ uint64_t SparseLineIndex::lineToOffset(uint64_t line) const
     std::shared_lock lock(m_mutex);
     if (m_checkpoints.empty()) return 0;
 
-    auto it = std::upper_bound(m_checkpoints.begin(), m_checkpoints.end(), line,
-        [](uint64_t l, const Checkpoint& cp) { return l < cp.line; });
-    if (it != m_checkpoints.begin()) --it;
+    // Past the last line of a fully scanned document the answer is end-of-file.
+    // Without this the forward scan below walks the entire remainder looking for
+    // a newline that cannot exist — which on a minified (single-line) document
+    // means re-scanning the whole file on every Down keypress.
+    if (m_complete && line > m_lastLine) return m_docBytes;
+
+    // First checkpoint at or past the target line. Only a line-start checkpoint
+    // answers directly; a mid-line byte sample sits somewhere inside the line,
+    // so fall back to the last checkpoint strictly before it and scan forward.
+    auto it = std::lower_bound(m_checkpoints.begin(), m_checkpoints.end(), line,
+        [](const Checkpoint& cp, uint64_t l) { return cp.line < l; });
+
+    if (it != m_checkpoints.end() && it->line == line && it->lineStart)
+        return it->offset;
+
+    // Everything before `it` has line < `line`, so stepping back is safe.
+    if (it == m_checkpoints.begin()) it = m_checkpoints.begin();
+    else                             --it;
 
     uint64_t curLine          = it->line;
     uint64_t curOffset        = it->offset;
@@ -316,9 +339,15 @@ uint64_t SparseLineIndex::lineEndOffset(uint64_t line) const
     const uint64_t start = lineToOffset(line);
 
     std::shared_lock lock(m_mutex);
-    const PieceTable* doc   = m_doc;
-    const uint64_t    total = m_docBytes;
+    const PieceTable* doc      = m_doc;
+    const uint64_t    total    = m_docBytes;
+    const bool        complete = m_complete;
+    const uint64_t    lastLine = m_lastLine;
     lock.unlock();
+
+    // The final line always runs to end-of-file, so there is nothing to scan
+    // for. This is the End-key path on a minified document.
+    if (complete && line >= lastLine) return total;
 
     if (!doc || start >= total) return total;
 

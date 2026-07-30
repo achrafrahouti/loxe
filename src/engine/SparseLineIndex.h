@@ -54,6 +54,11 @@ private:
     struct Checkpoint {
         uint64_t line;
         uint64_t offset;
+        // True when `offset` is the first byte of `line`. False for samples
+        // taken mid-line: a minified document has no newlines to hang
+        // checkpoints on, so positions are sampled by byte distance too, and
+        // those cannot answer "where does line N start".
+        bool     lineStart;
     };
 
     // Scans [from, to) counting newlines and appending checkpoints.

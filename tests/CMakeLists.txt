@@ -20,6 +20,7 @@ add_loxe_test(tst_FormatEngine)
 add_loxe_test(tst_SearchEngine)
 add_loxe_test(tst_XmlScanner)
 add_loxe_test(tst_Encoding)
+add_loxe_test(tst_Validator)
 
 # UI tests compile in the widget sources they drive.
 function(add_loxe_ui_test name)

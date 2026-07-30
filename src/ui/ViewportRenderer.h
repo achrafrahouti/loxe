@@ -91,12 +91,24 @@ private:
     // cursor offsets stay exact for multi-byte UTF-8 and tabs.
     struct VisualLine {
         uint64_t         startOffset = 0; // document offset of the first byte
-        uint64_t         byteLength  = 0; // bytes excluding the newline
+        uint64_t         byteLength  = 0; // bytes decoded, excluding the newline
         QString          text;            // decoded, tabs left as '\t'
         std::vector<int> unitToByte;       // size text.size()+1
+        // Set when the line ran past the decode budget rather than reaching a
+        // newline. Minified XML is one enormous line, so only the horizontally
+        // visible slice is ever materialised.
+        bool             clipped     = false;
     };
 
     int  visibleLineCount() const;
+    // Columns that fit across the text area.
+    int  visibleColumns() const;
+    // Cells a line must be decoded to in order to cover the current horizontal
+    // scroll position, plus a margin so small scrolls do not force a rebuild.
+    int  lineCellBudget() const;
+    // Reads and decodes one line starting at `start`, stopping at the newline or
+    // once `cellBudget` cells have been produced.
+    VisualLine decodeLineAt(uint64_t start, int cellBudget) const;
     void rebuildVisibleLines();
     void invalidateLines();
 

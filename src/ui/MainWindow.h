@@ -2,7 +2,11 @@
 
 #include <QMainWindow>
 #include <QStringList>
+#include <atomic>
 #include <memory>
+
+struct ValidationResult;
+template <typename T> class QFutureWatcher;
 
 class ViewportRenderer;
 class VirtualTreeModel;
@@ -84,6 +88,7 @@ private slots:
 
     // Background / deferred
     void onValidationTimeout();
+    void onValidationFinished();
     void onFileChangedOnDisk(const QString& path);
 
 private:
@@ -107,6 +112,7 @@ private:
     void updateEditActions();
     void updateContextPanels(uint64_t byteOffset);
     void scheduleValidation();
+    void cancelValidation();
     void watchCurrentFile();
 
     // Locates `term` from `from`; returns false when there is no match.
@@ -136,9 +142,15 @@ private:
     QAction* m_darkAction     = nullptr;
     QMenu*   m_recentMenu     = nullptr;
 
-    AsyncLoader*        m_loader     = nullptr;
+    AsyncLoader*        m_loader        = nullptr;
     QTimer*             m_validateTimer = nullptr;
-    QFileSystemWatcher* m_watcher    = nullptr;
+    QFileSystemWatcher* m_watcher       = nullptr;
+
+    // Well-formedness runs on a worker thread; the flag lets a superseded run
+    // abandon its parse as soon as the document changes underneath it. Shared
+    // so the in-flight lambda keeps it alive after we have dropped our copy.
+    QFutureWatcher<ValidationResult>*  m_validateWatcher = nullptr;
+    std::shared_ptr<std::atomic<bool>> m_validateCancel;
 
     QString     m_currentPath;
     QStringList m_recentFiles;

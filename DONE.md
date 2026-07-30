@@ -12,6 +12,9 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 | Tree level-1 population | < 3 s | 28 ms typical; bounded by an explicit byte cap |
 | Plain-text search | ≥ 500 MB/s | uses `memmem`; ~1 GB/s on cached data |
 | Beautify throughput | ≥ 50 MB/s | ~200 MB/s |
+| Repaint, 500 MB minified (one line) | ≥ 60 fps (≤ 16 ms) | 4.8 ms |
+| Keystroke, 500 MB minified | < 16 ms | < 1 ms typing; 20 ms for Down at EOF |
+| RAM, 500 MB minified | ≤ 80 MB | 68 MB peak |
 
 ## Project scaffold
 - CMake 3.24+ build system with `vcpkg.json` dependency manifest
@@ -20,7 +23,7 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   under both with leak detection on
 - GitHub Actions CI matrix (ubuntu-22.04 + macos-13)
 - Linux `.desktop` file and macOS `Info.plist` bundle metadata
-- 8 Qt Test binaries, ~140 test functions, all passing
+- 9 Qt Test binaries, ~185 test functions, all passing
 
 ## Engine layer
 
@@ -59,6 +62,11 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - Chunked `memchr` scan at 1.5–2.7 GB/s, releasing file pages as it advances
 - `attach()` makes lookups usable before any scanning — this is what lets the
   viewport paint the first screenful immediately
+- Checkpoints are sampled **by byte position as well as at newlines**. A minified
+  document has no newlines, so newline-only sampling would leave it with no
+  checkpoints at all and every lookup would rescan from byte 0
+- `lineToOffset()` short-circuits to EOF for lines past the end of a complete
+  index, so pressing Down on the last line does not scan the remainder
 - Bounded forward scans in `lineToOffset()` / `offsetToLine()` / `lineEndOffset()`
 - `invalidateFrom()` drops stale checkpoints; later lookups extend the array
   lazily from the last valid checkpoint and never rescan from byte 0
@@ -97,6 +105,19 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - Detection per ENC-01: BOM → XML declaration → UTF-8 validity → Latin-1
 - UTF-8 validator tolerant of sequences truncated by the probe boundary
 
+### Validator (new — replaces the inline CMarkup check)
+- Well-formedness via libxml2's streaming `xmlTextReader`, fed from the
+  PieceTable through a pull callback, releasing file pages as it advances
+- **No size cap**: the old CMarkup path needed the whole document in memory and
+  refused anything over 256 MB; a 2 GB file is now checked in bounded memory
+- Reports structured diagnostics with line and column, capped at 100, with a
+  `truncated` flag — enough to drive an errors panel and gutter markers
+- Cancellable between reads, so a superseded check abandons its parse
+- `XML_PARSE_NONET` and no `DTDLOAD`: never touches the network or fetches an
+  external DTD. No `NOENT`, so entity references are reported rather than
+  expanded. `XML_PARSE_HUGE` lifts libxml2's 10 MB text-node limit, which a
+  large-file editor would otherwise trip on legitimate documents
+
 ## UI layer
 
 ### AsyncLoader
@@ -118,6 +139,11 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - UTF-8 aware: each visible line carries a UTF-16-unit → byte-offset map, so
   cursor offsets stay exact for multi-byte characters
 - Tab expansion on a cell grid shared by painting and hit-testing
+- Decoding is budgeted to the horizontally visible columns, and tokens outside
+  that window are not drawn. Without this a minified document decoded and shaped
+  ~65 000 columns per row to display ~125, costing 1.5 s per repaint
+- A line longer than the budget is still **one** line: the remainder is reached
+  by scrolling right, not shown as extra rows with invented line numbers
 - Blinking caret honouring the platform flash time
 - Keyboard: arrows, Home/End, Ctrl+Home/End, Page Up/Down, Shift+movement for
   selection, Enter, Tab, Backspace, Delete, Ctrl+A/C/X/V
@@ -171,8 +197,9 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - Go to Line (Ctrl+G)
 - Beautify (Ctrl+Shift+B) and Minify (Ctrl+Shift+M) with a cancellable progress
   dialog, applied as one undo step
-- Debounced (500 ms) well-formedness check via `CMarkup::IsWellFormed()`, with
-  the error in the status bar tooltip
+- Debounced (500 ms) well-formedness check on a worker thread via `Validator`,
+  showing the failing line in the status bar and the full diagnostic list in its
+  tooltip; a check superseded by a newer edit cancels itself
 - Encoding detection shown in the status bar, BOM flagged
 - Recent files (20 entries) persisted across sessions
 - Breadcrumb and attribute panel follow the caret; caret selects the matching
@@ -187,12 +214,11 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - `--screenshot PATH` / `--screenshot-delay MS` renders the window and exits,
   which is how the UI is verified headlessly
 
-## third_party / CMarkup
-- `Markup.cpp` / `Markup.h` compiled as `libcmarkup.a`
-- `MARKUP_ICONV` enabled on POSIX; `iconv` linked only on macOS
-- Used for well-formedness validation only. **The vendored CMarkup 11.5 exposes
-  no streaming file API** — `Load()` explicitly fails when `MDF_READFILE` is set,
-  and there is no public `Open()` — so the tree cannot be built by seeking
-  CMarkup to a byte offset as originally designed. `SetDoc()` would require the
-  whole document in memory, which the 80 MB budget rules out. `XmlScanner`
-  exists for that reason; see [TODO.md](TODO.md).
+## Third-party XML: libxml2 (replaced CMarkup)
+- The vendored CMarkup 11.5 was removed entirely; `third_party/` no longer exists
+- CMarkup could not do the job: `Load()` refuses `MDF_READFILE` and no public
+  `Open()` is declared, so it has no usable streaming file API, and `SetDoc()`
+  needs the whole document resident. Its licence also restricted commercial use
+- libxml2 (MIT) is found via CMake's `FindLibXml2`; it ships with the macOS SDK
+  and is `libxml2-dev` on Debian/Ubuntu
+- Used **only** for well-formedness checking, never to build a DOM

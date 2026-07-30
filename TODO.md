@@ -11,14 +11,12 @@ These are deliberate departures from the original design in
 [CLAUDE.md](CLAUDE.md) / [requirements.md](requirements.md), recorded so they
 are not "fixed" by accident.
 
-- **The tree does not use CMarkup.** The vendored CMarkup 11.5 has no public
-  streaming file API: `CMarkup::Load()` returns `false` outright when
-  `MDF_READFILE` is set, and no `Open()` is declared. The documented "seek
-  CMarkup to `byte_offset`" approach is therefore not implementable with this
-  library, and `SetDoc()` would need the whole document resident, which the
-  80 MB budget forbids. `src/engine/XmlScanner.*` provides the streaming
-  tokeniser instead; CMarkup is used only for well-formedness validation.
-  Revisit if CMarkup is upgraded to a build that exposes its file mode.
+- **Two XML code paths, deliberately.** libxml2 (`src/engine/Validator.*`) does
+  well-formedness checking; `src/engine/XmlScanner.*` does traversal for the
+  tree and the formatter. They are not redundant: the tree needs byte offsets
+  for every node and the formatter needs verbatim source bytes, neither of which
+  libxml2's reader exposes. CMarkup, which previously did validation, has been
+  removed from the repository entirely.
 - **Tree expansion is bounded.** Enumerating an element's children means
   traversing its whole subtree, so expansion stops after 50,000 children or
   768 MB scanned and the parent is flagged partial. Without the byte cap, a 2 GB
@@ -33,7 +31,16 @@ are not "fixed" by accident.
 - **Reformat and regex search are capped at 256 MB** because both materialise
   the document (reformat to keep the operation a single undo step, regex because
   `QRegularExpression` needs a `QString`). Larger documents are refused with an
-  explanation rather than silently degrading.
+  explanation rather than silently degrading. Validation no longer has this cap.
+- **Very long lines are clipped, not wrapped.** Only the horizontally visible
+  slice of a line is decoded, so a minified document shows one line and the rest
+  is reached by scrolling right. Column reporting past the decoded window is not
+  yet exact, and `Ctrl+End` on a single-line 500 MB document costs ~20 ms.
+  Word wrap (TVP-12) is the real fix for reading minified files comfortably.
+- **Validation reports at most 100 diagnostics**, and a *fatal* parse error
+  stops libxml2 at the first complaint — so a badly broken document shows one
+  error, not a list. Non-fatal errors (undefined namespace prefixes, say)
+  accumulate up to the cap.
 
 ---
 
@@ -64,6 +71,9 @@ are not "fixed" by accident.
 ## UI
 
 ### ViewportRenderer
+- [ ] Horizontal `ensureCursorVisible`: moving the caret right along a very long
+      line does not scroll the view to follow it
+- [ ] Exact column numbers past the decode budget on very long lines
 - [ ] Matching tag-pair highlight when the cursor is inside a tag name (TVP-13)
 - [ ] Word wrap rendering (TVP-12)
 - [ ] Auto-close tags on `>` (EDT-06, configurable)
@@ -88,7 +98,10 @@ are not "fixed" by accident.
 - [ ] XPath 1.0 search (Ctrl+Shift+F) with tree + viewport highlight
 - [ ] Replace All for regex searches (plain text only today)
 - [ ] Errors panel and red squiggle gutter markers for validation failures
-- [ ] DTD validation command when a DOCTYPE is present
+      (`Validator` already returns line/column diagnostics; only the UI is missing)
+- [ ] DTD validation command when a DOCTYPE is present — now a matter of adding
+      `XML_PARSE_DTDVALID` to `Validator`, since libxml2 validates natively
+- [ ] XSD / RELAX NG validation, also available from libxml2
 - [ ] Restore the caret reliably after an external-change reload (currently a
       best-effort `singleShot`)
 
@@ -129,7 +142,8 @@ are not "fixed" by accident.
 ## Tests
 
 - [x] `tst_MmapBuffer`, `tst_PieceTable`, `tst_SparseLineIndex`,
-      `tst_FormatEngine`, `tst_SearchEngine`, `tst_XmlScanner`, `tst_Encoding`
+      `tst_FormatEngine`, `tst_SearchEngine`, `tst_XmlScanner`, `tst_Encoding`,
+      `tst_Validator`
 - [x] UI smoke tests driving real key and mouse events (`tst_ViewportEditing`)
 - [x] Round-trip test: open → beautify → save → reopen byte-identical
 - [x] Clean under ASan + UBSan with leak detection

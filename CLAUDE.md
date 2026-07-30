@@ -9,6 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
+# Build dependencies (Debian/Ubuntu). libxml2 ships with the macOS SDK.
+sudo apt-get install -y qt6-base-dev libxml2-dev
+
 # Configure and build (Release)
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 
@@ -26,7 +29,7 @@ cmake --build build --target test
 
 - **C++17** — minimum standard, no exceptions to this
 - **Qt 6.4+** — Qt5 is explicitly not supported
-- **CMarkup 11.5** — the only permitted third-party XML library; no libxml2, expat, pugixml, or any other. Note that the vendored copy exposes **no streaming file API** (`Load()` fails when `MDF_READFILE` is set; there is no public `Open()`), and `SetDoc()` needs the whole document resident. CMarkup is therefore used only for well-formedness validation of documents under 256 MB; all large-document traversal goes through our own `XmlScanner`.
+- **libxml2 2.9+** — the only permitted third-party XML library; no expat, pugixml, RapidXML, or any other. It replaced the vendored CMarkup, which had no usable streaming file API (`Load()` refuses `MDF_READFILE`, no public `Open()`) and a licence restricting commercial use. libxml2 is used **only** for well-formedness checking, through the streaming `xmlTextReader` (`src/engine/Validator.*`); it never builds a DOM. Document traversal for the tree and the formatter goes through our own `XmlScanner`, which a validating parser cannot replace because those need byte offsets and verbatim source bytes.
 - **CMake 3.24+** — build system; `vcpkg.json` pins dependency versions
 - **No Scintilla/QScintilla** — text editor is a custom `QWidget` (see `ViewportRenderer`)
 - **No Electron/CEF/web engine** — native Qt widgets only
@@ -46,13 +49,14 @@ File on disk
                     ├─> XmlScanner        — streaming node tokeniser; holds one node at a time
                     │       ├─> FormatEngine     — beautify / minify to a bounded sink
                     │       └─> VirtualTreeModel — QAbstractItemModel storing byte offsets only
+                    ├─> Validator         — libxml2 xmlTextReader fed from the PieceTable
                     └─> SearchEngine      — memmem over overlapping 1 MB windows
                             └─> AsyncLoader — QThread coordinating 3 phases: mmap → SparseLineIndex → tree level-1
 ```
 
 ### Key design invariants
 
-- **Nothing reads the whole document.** Every full-document pass streams in bounded chunks and calls `PieceTable::releasePagesBefore()` as it advances — mapped pages count toward RSS while resident, so an unreleased 2 GB pass blows the memory budget on its own. The two exceptions are deliberate and capped at 256 MB: CMarkup validation and regex search.
+- **Nothing reads the whole document.** Every full-document pass streams in bounded chunks and calls `PieceTable::releasePagesBefore()` as it advances — mapped pages count toward RSS while resident, so an unreleased 2 GB pass blows the memory budget on its own. Two operations still materialise the document and are therefore capped at 256 MB: reformatting (to stay a single undo step) and regex search (`QRegularExpression` needs a `QString`). Validation is *not* capped — libxml2 is fed through a pull callback.
 - **Cursor position** is stored as a `uint64_t` byte offset, not (line, col), so it survives edits. Byte↔column conversion happens per visible line via a UTF-16-unit → byte map.
 - **Tree nodes** store only byte offsets, depth and short display strings — never document content. Children are discovered by streaming that element's byte range via `fetchMore()`.
 - **Everything derived from the document reads the PieceTable, not the file.** The line index and the tree both do, so they stay correct after edits. Re-reading the file on disk would show stale content.
@@ -76,7 +80,7 @@ File on disk
 
 Tests use **Qt Test** (`QTest`). Every test target runs with `QT_QPA_PLATFORM=offscreen` so the suite works headless. Shared fixtures live in `tests/TestHelpers.h`.
 
-Existing coverage: `MmapBuffer`, `PieceTable`, `SparseLineIndex`, `FormatEngine`, `SearchEngine`, `XmlScanner`, `Encoding`, plus `tst_ViewportEditing`, which drives the editor through real `QTest::keyClick` / `keyClicks` events. The suite must stay clean under the Debug build's ASan + UBSan.
+Existing coverage: `MmapBuffer`, `PieceTable`, `SparseLineIndex`, `FormatEngine`, `SearchEngine`, `XmlScanner`, `Encoding`, `Validator`, plus `tst_ViewportEditing`, which drives the editor through real `QTest::keyClick` / `keyClicks` events. The suite must stay clean under the Debug build's ASan + UBSan.
 
 Two conventions worth knowing:
 

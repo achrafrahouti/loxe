@@ -29,6 +29,11 @@ private slots:
     void invalidateAfterEdit_lookupsStayCorrect();
     void estimatedLineCount_beforeComplete_isReasonable();
 
+    // Minified documents: no newlines at all.
+    void noNewlines_lineCountIsOne();
+    void noNewlines_lookupsAreCheap();
+    void noNewlines_lineToOffsetPastEnd_isImmediate();
+
 private:
     QTemporaryDir m_dir;
 };
@@ -282,6 +287,76 @@ void tst_SparseLineIndex::estimatedLineCount_beforeComplete_isReasonable()
     // Uniform line lengths, so the estimate should land within 25 %.
     QVERIFY2(estimate > exact / 2 && estimate < exact * 2,
              qPrintable(QString("estimate %1 vs exact %2").arg(estimate).arg(exact)));
+}
+
+// --- Minified / flat documents -----------------------------------------------
+//
+// A minified XML file is one enormous line. Checkpoints are normally emitted at
+// newlines, so without byte-position sampling such a document gets none at all
+// and every lookup degrades to a scan from byte 0.
+
+void tst_SparseLineIndex::noNewlines_lineCountIsOne()
+{
+    std::string text = "<root>";
+    text += std::string(4u << 20, 'x');
+    text += "</root>";
+    std::unique_ptr<PieceTable> pt(makeDoc(text));
+
+    SparseLineIndex idx;
+    std::atomic<bool> cancel{false};
+    QVERIFY(idx.build(*pt, cancel));
+
+    QCOMPARE(idx.lineCount(), uint64_t{1});
+    QCOMPARE(idx.lineToOffset(0), uint64_t{0});
+    QCOMPARE(idx.offsetToLine(pt->length()), uint64_t{0});
+    QCOMPARE(idx.lineEndOffset(0), pt->length());
+}
+
+void tst_SparseLineIndex::noNewlines_lookupsAreCheap()
+{
+    LOXE_SKIP_IF_SANITIZED();
+
+    // 32 MB on a single line. offsetToLine near the end must not rescan from
+    // the start: that is what made cursor movement take ~240 ms per keypress.
+    std::string text(32u << 20, 'x');
+    std::unique_ptr<PieceTable> pt(makeDoc(text));
+
+    SparseLineIndex idx;
+    std::atomic<bool> cancel{false};
+    QVERIFY(idx.build(*pt, cancel));
+
+    QElapsedTimer timer;
+    timer.start();
+    for (int i = 0; i < 20; ++i)
+        QCOMPARE(idx.offsetToLine(pt->length() - 1), uint64_t{0});
+    const qint64 usPerLookup = (timer.nsecsElapsed() / 1000) / 20;
+
+    QVERIFY2(usPerLookup < 5000,
+             qPrintable(QString("offsetToLine took %1 us").arg(usPerLookup)));
+}
+
+void tst_SparseLineIndex::noNewlines_lineToOffsetPastEnd_isImmediate()
+{
+    LOXE_SKIP_IF_SANITIZED();
+
+    // Pressing Down on the only line asks for line 1. On a complete index the
+    // answer is end-of-file; it must not be found by scanning for a newline
+    // that cannot exist.
+    std::string text(32u << 20, 'x');
+    std::unique_ptr<PieceTable> pt(makeDoc(text));
+
+    SparseLineIndex idx;
+    std::atomic<bool> cancel{false};
+    QVERIFY(idx.build(*pt, cancel));
+
+    QElapsedTimer timer;
+    timer.start();
+    for (int i = 0; i < 20; ++i)
+        QCOMPARE(idx.lineToOffset(1), pt->length());
+    const qint64 usPerLookup = (timer.nsecsElapsed() / 1000) / 20;
+
+    QVERIFY2(usPerLookup < 1000,
+             qPrintable(QString("lineToOffset took %1 us").arg(usPerLookup)));
 }
 
 QTEST_MAIN(tst_SparseLineIndex)

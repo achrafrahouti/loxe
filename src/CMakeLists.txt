@@ -6,10 +6,11 @@ add_library(loxe_engine STATIC
     engine/PieceTable.cpp
     engine/SearchEngine.cpp
     engine/SparseLineIndex.cpp
+    engine/Validator.cpp
     engine/XmlScanner.cpp
 )
 target_include_directories(loxe_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(loxe_engine PUBLIC cmarkup)
+target_link_libraries(loxe_engine PUBLIC LibXml2::LibXml2)
 
 qt_add_executable(loxe
     main.cpp
@@ -27,6 +28,7 @@ target_link_libraries(loxe PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Concurrent
 )
 
 set_target_properties(loxe PROPERTIES

@@ -14,7 +14,13 @@ if(UNIX AND NOT APPLE)
     add_compile_definitions(_FILE_OFFSET_BITS=64)
 endif()
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets Concurrent)
+
+# libxml2 provides well-formedness checking through its streaming xmlTextReader.
+# It replaced the vendored CMarkup, which had no usable streaming file API and
+# whose licence restricted commercial use. Ships with macOS; on Debian/Ubuntu it
+# is libxml2-dev.
+find_package(LibXml2 2.9 REQUIRED)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -23,7 +29,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
-add_subdirectory(third_party/cmarkup)
 add_subdirectory(src)
 
 enable_testing()

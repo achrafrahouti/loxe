@@ -5,6 +5,7 @@
     {
       "name": "qt6-base",
       "version>=": "6.4.0"
-    }
+    },
+    "libxml2"
   ]
 }

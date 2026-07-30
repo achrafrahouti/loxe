@@ -14,8 +14,8 @@ class PieceTable;
 // Reads input via PieceTable::Iterator and pushes output through a sink in
 // bounded blocks, so the full document is never materialised (peak output
 // buffer ≤ kOutputBufferSize). The tokeniser is a hand-written streaming XML
-// scanner: CMarkup's tree API would require holding the whole document in
-// memory, which the 2 GB / 80 MB budget rules out.
+// scanner: re-emitting nodes verbatim needs their exact source bytes, which a
+// DOM or validating parser does not preserve.
 class FormatEngine {
 public:
     // Output is handed to the sink in blocks no larger than this.

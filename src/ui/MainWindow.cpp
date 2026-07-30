@@ -10,7 +10,7 @@
 #include "../engine/PieceTable.h"
 #include "../engine/SearchEngine.h"
 #include "../engine/SparseLineIndex.h"
-#include "Markup.h"
+#include "../engine/Validator.h"
 
 #include <QApplication>
 #include <QCloseEvent>
@@ -28,6 +28,7 @@
 #include <QMimeData>
 #include <QProgressBar>
 #include <QProgressDialog>
+#include <QtConcurrent>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSettings>
@@ -42,8 +43,9 @@ namespace {
 
 constexpr int      kMaxRecentFiles   = 20;
 constexpr int      kValidationDelayMs = 500;
-// Above this size the whole document no longer fits comfortably in memory for
-// CMarkup validation or an in-memory reformat.
+// Above this size the document no longer fits comfortably in memory, which
+// rules out an in-memory reformat or a QString-based regex search. Validation
+// is exempt: libxml2 streams it.
 constexpr uint64_t kWholeDocumentLimit = 256ull * 1024 * 1024;
 
 QString elide(const QString& s, int maxChars)
@@ -67,6 +69,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     m_validateTimer->setInterval(kValidationDelayMs);
     connect(m_validateTimer, &QTimer::timeout, this, &MainWindow::onValidationTimeout);
 
+    m_validateWatcher = new QFutureWatcher<ValidationResult>(this);
+    connect(m_validateWatcher, &QFutureWatcher<ValidationResult>::finished,
+            this, &MainWindow::onValidationFinished);
+
     m_watcher = new QFileSystemWatcher(this);
     connect(m_watcher, &QFileSystemWatcher::fileChanged,
             this, &MainWindow::onFileChangedOnDisk);
@@ -74,7 +80,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     newDocument();
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow()
+{
+    // The worker holds a raw PieceTable pointer, so it must finish before the
+    // document is destroyed.
+    cancelValidation();
+    if (m_validateWatcher) m_validateWatcher->waitForFinished();
+}
 
 // --- Document lifecycle ---
 
@@ -114,6 +126,8 @@ void MainWindow::newDocument()
     if (!confirmDiscardChanges()) return;
 
     if (m_loader) m_loader->cancel();
+    cancelValidation();
+    m_validateWatcher->waitForFinished();
 
     // Order matters: the viewport must drop its pointers before the objects die.
     m_viewport->setDocument(nullptr, nullptr);
@@ -141,6 +155,10 @@ void MainWindow::newDocument()
 
 void MainWindow::onFileReady(MmapBuffer* buf, PieceTable* table, SparseLineIndex* index)
 {
+    // A check may still be running against the outgoing document.
+    cancelValidation();
+    m_validateWatcher->waitForFinished();
+
     // Detach the viewport before the previous document is destroyed.
     m_viewport->setDocument(nullptr, nullptr);
 
@@ -700,25 +718,68 @@ void MainWindow::onValidationTimeout()
 {
     if (!m_pieceTable) return;
 
-    const uint64_t len = m_pieceTable->length();
-    if (len > kWholeDocumentLimit) {
-        m_statusValid->setText(tr("— not checked"));
-        m_statusValid->setToolTip(tr("Document too large for well-formedness checking."));
-        return;
-    }
+    // Supersede any check still running against an older revision of the
+    // document, then start a fresh one.
+    cancelValidation();
 
-    CMarkup markup;
-    markup.SetDoc(m_pieceTable->read(0, len));
-    if (markup.IsWellFormed()) {
+    m_statusValid->setText(tr("… checking"));
+    m_statusValid->setStyleSheet({});
+    m_statusValid->setToolTip({});
+
+    m_validateCancel = std::make_shared<std::atomic<bool>>(false);
+    auto flag        = m_validateCancel;
+    const PieceTable* doc = m_pieceTable.get();
+
+    // libxml2 streams the document, so there is no size limit to respect here;
+    // it runs off the UI thread because a 2 GB check takes seconds.
+    m_validateWatcher->setFuture(QtConcurrent::run([doc, flag] {
+        return Validator::validate(*doc, flag.get());
+    }));
+}
+
+void MainWindow::cancelValidation()
+{
+    if (m_validateCancel) m_validateCancel->store(true);
+    m_validateCancel.reset();
+}
+
+void MainWindow::onValidationFinished()
+{
+    if (m_validateWatcher->isCanceled()) return;
+    const ValidationResult result = m_validateWatcher->result();
+
+    // A result for a document revision we have since moved past.
+    if (result.cancelled) return;
+
+    if (result.wellFormed) {
         m_statusValid->setText(QStringLiteral("✔ ") + tr("Well-formed"));
         m_statusValid->setStyleSheet(QStringLiteral("color: #067d17;"));
         m_statusValid->setToolTip({});
-    } else {
-        const QString err = QString::fromStdString(markup.GetError());
-        m_statusValid->setText(QStringLiteral("✘ ") + tr("Not well-formed"));
-        m_statusValid->setStyleSheet(QStringLiteral("color: #cc0000;"));
-        m_statusValid->setToolTip(err);
+        return;
     }
+
+    m_statusValid->setStyleSheet(QStringLiteral("color: #cc0000;"));
+
+    const XmlDiagnostic* first = result.primary();
+    if (!first) {
+        m_statusValid->setText(QStringLiteral("✘ ") + tr("Not well-formed"));
+        m_statusValid->setToolTip({});
+        return;
+    }
+
+    m_statusValid->setText(QStringLiteral("✘ ") + tr("Line %1").arg(first->line));
+
+    // Full diagnostic list in the tooltip, newest parser complaints first.
+    QStringList lines;
+    for (const auto& d : result.diagnostics) {
+        lines << tr("Line %1, column %2: %3")
+                     .arg(d.line)
+                     .arg(d.column)
+                     .arg(QString::fromStdString(d.message));
+    }
+    if (result.truncated)
+        lines << tr("… further errors suppressed");
+    m_statusValid->setToolTip(lines.join(QLatin1Char('\n')));
 }
 
 // --- External modification ---

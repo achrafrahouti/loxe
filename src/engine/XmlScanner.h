@@ -31,8 +31,9 @@ struct XmlNode {
 // The whole point is that it never holds more than one node in memory, so it
 // works on a 2 GB document within the resident-memory budget. It is deliberately
 // a scanner rather than a validating parser: no DTD handling, no namespace
-// resolution, no well-formedness enforcement. CMarkup covers validation, but it
-// requires the entire document in memory, which rules it out for the tree.
+// resolution, no well-formedness enforcement. Validator (libxml2) covers that;
+// this exists because the tree needs byte offsets and a node-at-a-time cursor,
+// which a validating parser does not give us.
 //
 // This is the shared tokeniser behind both FormatEngine and VirtualTreeModel.
 class XmlScanner {

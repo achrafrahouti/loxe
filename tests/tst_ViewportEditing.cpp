@@ -46,6 +46,10 @@ private slots:
     void undoRedo_restoresDocumentAndCursor();
     void readOnly_rejectsEdits();
 
+    // Minified documents (one enormous line).
+    void flatDocument_reportsSingleLine();
+    void flatDocument_cursorEndStaysOnLineOne();
+
     void utf8_cursorMovesByCharacterNotByte();
     void utf8_backspaceDeletesWholeCharacter();
 
@@ -332,6 +336,41 @@ void tst_ViewportEditing::readOnly_rejectsEdits()
 
     QCOMPARE(text(), std::string("<a/>"));
     QVERIFY(!m_table->canUndo());
+}
+
+// --- Minified documents ---
+
+void tst_ViewportEditing::flatDocument_reportsSingleLine()
+{
+    // A minified file has no newlines. The viewport must not chop it into
+    // pseudo-rows with invented line numbers: it is one line, and the rest is
+    // reached by scrolling horizontally.
+    std::string text = "<root>";
+    text += std::string(512u * 1024, 'x');   // far wider than any viewport
+    text += "</root>";
+    setDoc(text);
+
+    QCOMPARE(m_index->lineCount(), uint64_t{1});
+    QCOMPARE(m_viewport->cursorLine(), uint64_t{0});
+
+    // Column 0 of line 0 is byte 0 whatever the line length.
+    m_viewport->setCursorOffset(0);
+    QCOMPARE(m_viewport->cursorColumn(), 0);
+}
+
+void tst_ViewportEditing::flatDocument_cursorEndStaysOnLineOne()
+{
+    std::string text(256u * 1024, 'y');
+    setDoc(text);
+
+    key(Qt::Key_End, Qt::ControlModifier);
+    QCOMPARE(m_viewport->cursorOffset(), m_table->length());
+    QCOMPARE(m_viewport->cursorLine(), uint64_t{0});
+
+    // Down on the only line clamps to the end rather than inventing a line.
+    key(Qt::Key_Down);
+    QCOMPARE(m_viewport->cursorLine(), uint64_t{0});
+    QCOMPARE(m_viewport->cursorOffset(), m_table->length());
 }
 
 // --- UTF-8 ---
