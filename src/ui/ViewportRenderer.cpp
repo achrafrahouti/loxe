@@ -875,17 +875,23 @@ ViewportRenderer::VisualLine ViewportRenderer::decodeLineAt(uint64_t start,
     uint64_t    pos        = start;
     bool        sawNewline = false;
     while (pos < docLen && raw.size() < maxBytes) {
-        const uint64_t want = std::min<uint64_t>(8192, docLen - pos);
-        std::string chunk = m_table->read(pos, want);
-        if (chunk.empty()) break;
-        const size_t nl = chunk.find('\n');
+        // Read straight into the accumulator: read() would hand back a fresh
+        // std::string per 8 KB, and this runs for every visible line of every
+        // frame.
+        const size_t want = static_cast<size_t>(std::min<uint64_t>(8192, docLen - pos));
+        const size_t base = raw.size();
+        raw.resize(base + want);
+        const size_t got = m_table->readInto(pos, raw.data() + base, want);
+        raw.resize(base + got);
+        if (got == 0) break;
+
+        const size_t nl = raw.find('\n', base);
         if (nl != std::string::npos) {
-            raw.append(chunk, 0, nl);
+            raw.resize(nl);
             sawNewline = true;
             break;
         }
-        raw.append(chunk);
-        pos += chunk.size();
+        pos += got;
     }
 
     // Ran out of budget before finding the newline: this is a long line and we
@@ -905,6 +911,20 @@ ViewportRenderer::VisualLine ViewportRenderer::decodeLineAt(uint64_t start,
     line.text.reserve(static_cast<int>(raw.size()));
     line.unitToByte.reserve(raw.size() + 1);
     for (size_t b = 0; b < raw.size();) {
+        // ASCII, which is nearly all of any XML document, converts one run at a
+        // time: a QString per character costs ~16× as much, and this is the
+        // per-frame path that the 60 fps target lives on. Below 0x80 Latin-1 and
+        // UTF-8 agree, and each byte is exactly one UTF-16 unit.
+        size_t e = b;
+        while (e < raw.size() && static_cast<unsigned char>(raw[e]) < 0x80) ++e;
+        if (e > b) {
+            line.text += QString::fromLatin1(raw.data() + b, static_cast<qsizetype>(e - b));
+            for (size_t k = b; k < e; ++k)
+                line.unitToByte.push_back(static_cast<int>(k));
+            b = e;
+            continue;
+        }
+
         int len = utf8SeqLen(static_cast<unsigned char>(raw[b]));
         if (b + static_cast<size_t>(len) > raw.size()) len = 1;
         QString ch = QString::fromUtf8(raw.data() + b, len);

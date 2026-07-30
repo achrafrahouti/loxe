@@ -118,6 +118,14 @@ private:
     // All *Locked helpers assume the caller holds m_mutex.
     uint64_t lengthLocked() const;
 
+    // Piece containing document position `pos`, with its start offset in
+    // *accOut. Resumes from a per-thread cursor when possible, so a sequential
+    // pass does not re-walk the list on every call. Caller must hold m_mutex.
+    std::list<Piece>::const_iterator seek(uint64_t pos, uint64_t* accOut) const;
+
+    // Stamp identifying one immutable state of the piece list.
+    static uint64_t nextGeneration();
+
     // Locates the piece containing document position pos.
     // Returns {end(), 0} when pos is at (or past) the end of the document.
     std::pair<std::list<Piece>::iterator, uint64_t> findPiece(uint64_t pos);
@@ -132,6 +140,11 @@ private:
     const MmapBuffer* m_file;
     std::string       m_addBuffer;
     std::list<Piece>  m_pieces;
+    // Sum of the piece lengths, maintained incrementally. length() is called
+    // once per read on every streaming pass, so it must not walk the list.
+    uint64_t          m_length = 0;
+    // Bumped by every mutation; invalidates cached piece iterators.
+    uint64_t          m_generation = nextGeneration();
 
     std::vector<UndoRecord> m_undoStack;
     int                     m_undoIndex     = -1;

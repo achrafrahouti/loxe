@@ -19,8 +19,13 @@ struct TreeNode {
     bool     isLoaded    = false;
     bool     truncated   = false; // child list was capped
     int      parentIndex = -1;
+    // Children occupy the contiguous range [firstChild, firstChild + childCount)
+    // of the node vector: every expansion appends its children as one batch and
+    // nothing is ever removed, so a node's child range never moves. That is what
+    // makes index()/rowCount() O(1) instead of a sibling-chain walk — expanding
+    // 50 000 siblings through a linked chain is quadratic and took ~16 s.
     int      firstChild  = -1;
-    int      nextSibling = -1;
+    int      childCount  = 0;
 };
 
 // QAbstractItemModel backed by a flat std::vector<TreeNode>.
@@ -104,14 +109,15 @@ private:
     // Returns the node index encoded in a QModelIndex internalId.
     int nodeIndexOf(const QModelIndex& idx) const;
 
-    // Returns the row of nodeIdx among its siblings (O(siblings)).
+    // Returns the row of nodeIdx among its siblings.
     int rowOfNode(int nodeIdx) const;
 
-    // Root-level nodes are not linked by nextSibling, so they are walked by
-    // scanning for parentIndex == -1.
-    int firstRootNode() const;
-    int nextRootNode(int from) const;
+    // Rebuilds m_roots from m_nodes.
+    void rebuildRoots();
 
     const PieceTable*     m_doc = nullptr;
     std::vector<TreeNode> m_nodes;
+    // Indices of the top-level nodes, in row order. Kept explicitly so the root
+    // rows need no scan of the whole node vector.
+    std::vector<int>      m_roots;
 };

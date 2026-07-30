@@ -2,6 +2,7 @@
 #include "MmapBuffer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -17,20 +18,36 @@ uint64_t listBytes(const std::list<Piece>& l)
     return static_cast<uint64_t>(l.size()) * kBytesPerPiece;
 }
 
+// Globally unique, monotonically increasing. A cached iterator is only reused
+// when the generation still matches, and because the counter is never reused
+// no other PieceTable — including one allocated at a recycled address — can
+// validate a stale cache.
+std::atomic<uint64_t> g_generation{1};
+
 } // namespace
+
+uint64_t PieceTable::nextGeneration()
+{
+    return g_generation.fetch_add(1, std::memory_order_relaxed);
+}
 
 PieceTable::PieceTable(const MmapBuffer* file) : m_file(file)
 {
-    if (file && file->isOpen() && file->size() > 0)
+    if (file && file->isOpen() && file->size() > 0) {
         m_pieces.push_back({PieceOrigin::File, 0, file->size()});
+        m_length = file->size();
+    }
 }
 
 uint64_t PieceTable::length() const
 {
     std::shared_lock lock(m_mutex);
-    return lengthLocked();
+    return m_length;
 }
 
+// Only for recovering the cached length after the piece list is replaced
+// wholesale (undo/redo). Every other path adjusts m_length incrementally —
+// walking the list per edit made a long Replace All quadratic on its own.
 uint64_t PieceTable::lengthLocked() const
 {
     uint64_t total = 0;
@@ -51,10 +68,17 @@ void PieceTable::insert(uint64_t pos, std::string_view text)
     if (text.empty()) return;
     std::unique_lock lock(m_mutex);
 
-    const uint64_t total = lengthLocked();
+    const uint64_t total = m_length;
     if (pos > total) pos = total;
 
-    std::list<Piece> before = m_pieces;
+    // Inside an undo group the group's own pre-edit snapshot is what gets
+    // recorded, so copying the whole piece list per edit is pure waste — and
+    // with the list growing by two pieces per edit, quadratic waste.
+    std::list<Piece> before;
+    if (m_groupDepth == 0) before = m_pieces;
+
+    m_length += text.size();
+    m_generation = nextGeneration();
 
     const uint64_t addOffset = m_addBuffer.size();
     m_addBuffer.append(text.data(), text.size());
@@ -104,11 +128,15 @@ void PieceTable::remove(uint64_t pos, uint64_t len)
     if (len == 0) return;
     std::unique_lock lock(m_mutex);
 
-    const uint64_t total = lengthLocked();
+    const uint64_t total = m_length;
     if (pos >= total) return;
     len = std::min(len, total - pos);
 
-    std::list<Piece> before = m_pieces;
+    std::list<Piece> before;
+    if (m_groupDepth == 0) before = m_pieces;
+
+    m_length -= len;
+    m_generation = nextGeneration();
 
     // Put a piece boundary exactly on pos, then drop whole pieces until len
     // bytes are gone, trimming the final partially-covered piece.
@@ -151,6 +179,8 @@ void PieceTable::appendInitial(std::string_view text)
 
     const uint64_t addOffset = m_addBuffer.size();
     m_addBuffer.append(text.data(), text.size());
+    m_length += text.size();
+    m_generation = nextGeneration();
 
     if (!m_pieces.empty()) {
         Piece& back = m_pieces.back();
@@ -208,6 +238,8 @@ void PieceTable::undo(uint64_t* cursorOut)
     if (m_undoIndex < 0) return;
     const UndoRecord& rec = m_undoStack[static_cast<size_t>(m_undoIndex)];
     m_pieces = rec.before;
+    m_length     = lengthLocked(); // the list was replaced wholesale
+    m_generation = nextGeneration();
     if (cursorOut) *cursorOut = rec.cursorBefore;
     --m_undoIndex;
 }
@@ -217,7 +249,9 @@ void PieceTable::redo(uint64_t* cursorOut)
     std::unique_lock lock(m_mutex);
     if (m_undoIndex + 1 >= static_cast<int>(m_undoStack.size())) return;
     const UndoRecord& rec = m_undoStack[static_cast<size_t>(++m_undoIndex)];
-    m_pieces = rec.after;
+    m_pieces     = rec.after;
+    m_length     = lengthLocked();
+    m_generation = nextGeneration();
     if (cursorOut) *cursorOut = rec.cursorAfter;
 }
 
@@ -246,18 +280,51 @@ bool PieceTable::undoTruncated() const
 
 // --- Reading ---
 
+// Locates the piece containing `pos`, resuming from this thread's last lookup
+// when that lands at or before `pos`. Every reader here is a sequential pass, so
+// without the cursor each call re-walks the list from the head — after a large
+// Replace All leaves millions of pieces behind, that alone takes a streaming
+// read from GB/s down to single-digit MB/s.
+//
+// The cursor is thread_local, so concurrent readers under the shared lock never
+// touch each other's copy, and it is invalidated by the generation stamp that
+// every mutation bumps.
+std::list<Piece>::const_iterator PieceTable::seek(uint64_t pos, uint64_t* accOut) const
+{
+    struct Cursor {
+        const PieceTable*                table = nullptr;
+        uint64_t                         gen   = 0;
+        std::list<Piece>::const_iterator it;
+        uint64_t                         acc   = 0;
+    };
+    static thread_local Cursor cursor;
+
+    auto     it  = m_pieces.cbegin();
+    uint64_t acc = 0;
+    if (cursor.table == this && cursor.gen == m_generation && cursor.acc <= pos) {
+        it  = cursor.it;
+        acc = cursor.acc;
+    }
+
+    while (it != m_pieces.cend() && pos >= acc + it->length) {
+        acc += it->length;
+        ++it;
+    }
+
+    if (it != m_pieces.cend())
+        cursor = Cursor{this, m_generation, it, acc};
+
+    *accOut = acc;
+    return it;
+}
+
 size_t PieceTable::readInto(uint64_t pos, char* dst, size_t len) const
 {
     if (!dst || len == 0) return 0;
     std::shared_lock lock(m_mutex);
 
-    // Walk to the piece containing pos.
-    auto     it  = m_pieces.cbegin();
     uint64_t acc = 0;
-    while (it != m_pieces.cend() && pos >= acc + it->length) {
-        acc += it->length;
-        ++it;
-    }
+    auto     it  = seek(pos, &acc);
     if (it == m_pieces.cend()) return 0;
 
     size_t   written  = 0;
@@ -304,16 +371,36 @@ void PieceTable::releasePagesBefore(uint64_t offset) const
     if (!m_file || offset == 0) return;
     std::shared_lock lock(m_mutex);
 
-    // Walk the pieces covering [0, offset) and drop the file-backed ones. ADD
-    // pieces are ordinary heap memory and stay put.
+    // Resume where this thread's previous call stopped: callers invoke this
+    // every few megabytes of a sequential pass, and re-walking [0, offset) each
+    // time is quadratic in the piece count. Pages before `from` were already
+    // advised away by the earlier call.
+    struct Released {
+        const PieceTable*                table = nullptr;
+        uint64_t                         gen   = 0;
+        std::list<Piece>::const_iterator it;
+        uint64_t                         acc   = 0; // document offset of *it
+    };
+    static thread_local Released last;
+
+    auto     it  = m_pieces.cbegin();
     uint64_t acc = 0;
-    for (const auto& p : m_pieces) {
-        if (acc >= offset) break;
-        const uint64_t covered = std::min<uint64_t>(p.length, offset - acc);
-        if (p.origin == PieceOrigin::File)
-            m_file->adviseDontNeed(p.offset, covered);
-        acc += p.length;
+    if (last.table == this && last.gen == m_generation && last.acc <= offset) {
+        it  = last.it;
+        acc = last.acc;
     }
+
+    // Drop the file-backed pieces covering [acc, offset). ADD pieces are
+    // ordinary heap memory and stay put.
+    for (; it != m_pieces.cend() && acc < offset; ++it) {
+        const uint64_t covered = std::min<uint64_t>(it->length, offset - acc);
+        if (it->origin == PieceOrigin::File)
+            m_file->adviseDontNeed(it->offset, covered);
+        if (acc + it->length > offset) break; // partially covered: revisit it
+        acc += it->length;
+    }
+
+    last = Released{this, m_generation, it, acc};
 }
 
 std::string_view PieceTable::chunkAt(uint64_t pos, size_t maxLen) const
@@ -321,12 +408,8 @@ std::string_view PieceTable::chunkAt(uint64_t pos, size_t maxLen) const
     if (maxLen == 0) return {};
     std::shared_lock lock(m_mutex);
 
-    auto     it  = m_pieces.cbegin();
     uint64_t acc = 0;
-    while (it != m_pieces.cend() && pos >= acc + it->length) {
-        acc += it->length;
-        ++it;
-    }
+    auto     it  = seek(pos, &acc);
     if (it == m_pieces.cend()) return {};
 
     const uint64_t piecePos = pos - acc;

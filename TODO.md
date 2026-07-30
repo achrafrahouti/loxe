@@ -49,9 +49,21 @@ are not "fixed" by accident.
 
 ## Engine
 
+### XmlScanner
+- [ ] Comments, CDATA sections, DOCTYPEs and tags are accumulated whole in the
+      `node` buffer, unlike text nodes which are split at `kMaxTextNode`. A
+      document with a 500 MB CDATA island therefore holds all of it in memory
+      and blows the 80 MB budget. Splitting them needs a "node continues"
+      flag in the callback contract, since FormatEngine re-emits them verbatim.
+
 ### PieceTable
 - [ ] Piece-list compaction: long editing sessions grow the list without bound
-      since only adjacent ADD pieces coalesce
+      since only adjacent ADD pieces coalesce. Less pressing now that reads
+      resume from a per-thread cursor rather than re-walking the list, but a
+      Replace All still leaves two pieces per match behind.
+- [ ] `findPiece()` (the write path) is still a walk from the head, so an edit
+      loop running *front to back* is quadratic. Replace All rewrites back to
+      front, which happens to keep it O(1) per edit.
 - [ ] Persist the ADD buffer for crash recovery (REL-05)
 
 ### SparseLineIndex
