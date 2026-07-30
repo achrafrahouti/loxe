@@ -40,6 +40,19 @@ endfunction()
 
 add_loxe_ui_test(tst_ViewportEditing)
 
+# VirtualTreeModel is a QAbstractItemModel: QtCore plus QtGui for QColor.
+qt_add_executable(tst_VirtualTreeModel
+    tst_VirtualTreeModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/ui/VirtualTreeModel.cpp
+)
+target_include_directories(tst_VirtualTreeModel PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(tst_VirtualTreeModel PRIVATE Qt6::Test Qt6::Gui loxe_engine)
+add_test(NAME tst_VirtualTreeModel COMMAND tst_VirtualTreeModel)
+set_tests_properties(tst_VirtualTreeModel PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 # XmlContext needs QtCore only, but lives in ui/.
 qt_add_executable(tst_XmlContext
     tst_XmlContext.cpp

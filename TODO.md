@@ -97,6 +97,11 @@ are not "fixed" by accident.
 
 ### MainWindow
 - [ ] Tree context menu: add *Delete element* and *Copy element without children*
+- [ ] A parsed preview is read-only. Editing it would need the formatted text
+      mapped back to the original byte range — worth doing as "reformat this
+      element in place", which would be a normal undoable edit
+- [ ] Parse is capped at 64 MB because the element is copied and reformatted in
+      memory; streaming it to a temp document would lift that
 - [ ] Scoped view is entered from the tree only; no way to scope from the caret
 - [ ] `tst_MainWindow` does not exist, so the context-menu actions are covered
       only through `ViewportRenderer`/`VirtualTreeModel` unit tests
@@ -154,6 +159,8 @@ are not "fixed" by accident.
 - [x] UI smoke tests driving real key and mouse events (`tst_ViewportEditing`)
 - [x] `tst_XmlContext` covering the breadcrumb failures (unclosed elements,
       comments, CDATA, angle brackets inside attribute values)
+- [x] `tst_VirtualTreeModel` covering element ranges, XPath generation and the
+      Parse pipeline on a minified document
 - [x] Round-trip test: open → beautify → save → reopen byte-identical
 - [x] Clean under ASan + UBSan with leak detection
 - [ ] Memory assertions in CI: RSS ≤ 80 MB for a 2 GB file (verified manually

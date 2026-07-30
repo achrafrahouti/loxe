@@ -23,7 +23,7 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   under both with leak detection on
 - GitHub Actions CI matrix (ubuntu-22.04 + macos-13)
 - Linux `.desktop` file and macOS `Info.plist` bundle metadata
-- 10 Qt Test binaries, ~210 test functions, all passing
+- 11 Qt Test binaries, ~220 test functions, all passing
 
 ## Engine layer
 
@@ -227,11 +227,21 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - Session geometry, window state and splitter position via `QSettings`
 - Drag-and-drop file opening
 - **Tree context menu** (right-click an element):
-  - *Parse <name> — show only this element*: scopes the editor to that element
+  - *Parse <name> — show it formatted*: extracts the element, beautifies it into
+    a separate in-memory document and shows that. A minified file therefore
+    still reads as indented, multi-line XML. The copy is read-only and the real
+    document stays loaded underneath, so Parse never edits the file — saving,
+    search, validation and the tree all keep working against the original.
+    Capped at 64 MB, since reformatting needs roughly twice the element's size.
+  - *Show only <name> (raw, editable)*: scopes the viewport to the element's
+    live bytes instead, for editing it in isolation
   - *Copy <name> to clipboard*: its full source, with a confirmation above 32 MB
-  - *Copy XPath*, *Go to element*, and *Show whole document* when scoped
-  - View ▸ Show Whole Document (Ctrl+Shift+W) leaves the scope; the title bar
-    carries an `[element view]` marker while it is active
+  - *Copy XPath*, *Go to element*, and *Show whole document*
+  - View ▸ Show Whole Document (Ctrl+Shift+W) leaves either mode; the title bar
+    shows `[parsed <name>]` or `[element view]` while one is active
+  - While a preview is up the breadcrumb, attribute panel and Go to Line follow
+    the previewed copy; tree-following is suspended because its offsets refer to
+    the reformatted text, and starting a search leaves the preview first
 
 ### CLI
 - `--line N`, `--search TERM`, `--ro` all wired up

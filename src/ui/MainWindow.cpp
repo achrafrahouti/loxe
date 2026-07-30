@@ -51,6 +51,9 @@ constexpr int      kValidationDelayMs = 500;
 constexpr uint64_t kWholeDocumentLimit = 256ull * 1024 * 1024;
 // Copying more than this to the clipboard is confirmed first.
 constexpr uint64_t kMaxClipboardBytes = 32ull * 1024 * 1024;
+// "Parse" copies and reformats the element in memory, so it is capped well
+// below the whole-document limit.
+constexpr uint64_t kMaxParseBytes = 64ull * 1024 * 1024;
 
 QString elide(const QString& s, int maxChars)
 {
@@ -132,6 +135,7 @@ void MainWindow::newDocument()
     if (m_loader) m_loader->cancel();
     cancelValidation();
     m_validateWatcher->waitForFinished();
+    exitPreview();
 
     // Order matters: the viewport must drop its pointers before the objects die.
     m_viewport->setDocument(nullptr, nullptr);
@@ -162,6 +166,7 @@ void MainWindow::onFileReady(MmapBuffer* buf, PieceTable* table, SparseLineIndex
     // A check may still be running against the outgoing document.
     cancelValidation();
     m_validateWatcher->waitForFinished();
+    exitPreview();
 
     // Detach the viewport before the previous document is destroyed.
     m_viewport->setDocument(nullptr, nullptr);
@@ -347,8 +352,9 @@ void MainWindow::onEditFindReplace()
 
 void MainWindow::onEditGoToLine()
 {
-    if (!m_lineIndex) return;
-    const auto total = static_cast<int>(std::min<uint64_t>(m_lineIndex->lineCount(), INT32_MAX));
+    SparseLineIndex* index = activeIndex();
+    if (!index) return;
+    const auto total = static_cast<int>(std::min<uint64_t>(index->lineCount(), INT32_MAX));
     bool ok = false;
     const int line = QInputDialog::getInt(
         this, tr("Go to Line"), tr("Line (1–%1):").arg(total),
@@ -358,8 +364,9 @@ void MainWindow::onEditGoToLine()
 
 void MainWindow::gotoLine(uint64_t line)
 {
-    if (!m_lineIndex) return;
-    m_viewport->setCursorOffset(m_lineIndex->lineToOffset(line));
+    SparseLineIndex* index = activeIndex();
+    if (!index) return;
+    m_viewport->setCursorOffset(index->lineToOffset(line));
     m_viewport->setFocus();
 }
 
@@ -371,6 +378,7 @@ void MainWindow::onFormatMinify()   { runFormat(true); }
 void MainWindow::runFormat(bool minify)
 {
     if (!m_pieceTable) return;
+    exitPreview();
     if (m_isReadOnly) {
         QMessageBox::warning(this, tr("Read-only"), tr("This document is read-only."));
         return;
@@ -450,15 +458,20 @@ void MainWindow::onViewToggleDarkTheme()
 
 void MainWindow::onCursorMoved(uint64_t byteOffset)
 {
-    if (!m_lineIndex) return;
+    SparseLineIndex* index = activeIndex();
+    if (!index) return;
 
-    const uint64_t line = m_lineIndex->offsetToLine(byteOffset);
+    const uint64_t line = index->offsetToLine(byteOffset);
     m_statusPos->setText(tr("Ln %1, Col %2")
         .arg(line + 1)
         .arg(m_viewport->cursorColumn() + 1));
 
     updateContextPanels(byteOffset);
     updateEditActions();
+
+    // Offsets in a preview refer to the reformatted copy, not the file, so
+    // there is nothing meaningful to select in the tree.
+    if (previewActive()) return;
 
     // Follow the caret in the tree, but only among nodes already loaded — this
     // runs on every cursor movement and must never trigger a document scan.
@@ -482,9 +495,10 @@ void MainWindow::onDocumentEdited(uint64_t offset)
 
 void MainWindow::updateContextPanels(uint64_t byteOffset)
 {
-    if (!m_pieceTable) return;
+    PieceTable* doc = activeDocument();
+    if (!doc) return;
 
-    const XmlContextInfo ctx = XmlContext::contextAt(*m_pieceTable, byteOffset);
+    const XmlContextInfo ctx = XmlContext::contextAt(*doc, byteOffset);
 
     // Breadcrumb: an XPath-ish path from the root to the current element.
     QString path = ctx.ancestors.isEmpty() ? QString()
@@ -527,15 +541,17 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
     const QString name = model->tagNameFor(index);
 
     QMenu menu(this);
-    menu.addAction(tr("Parse <%1> — show only this element").arg(name),
+    menu.addAction(tr("Parse <%1> — show it formatted").arg(name),
                    this, &MainWindow::onTreeParseElement);
+    menu.addAction(tr("Show only <%1> (raw, editable)").arg(name),
+                   this, &MainWindow::onTreeShowRawElement);
     menu.addAction(tr("Copy <%1> to clipboard").arg(name),
                    this, &MainWindow::onTreeCopyElement);
     menu.addSeparator();
     menu.addAction(tr("Copy XPath"), this, &MainWindow::onTreeCopyXPath);
     menu.addAction(tr("Go to element"), this, [this, index] { onTreeNodeActivated(index); });
 
-    if (m_viewport->hasViewRange()) {
+    if (m_viewport->hasViewRange() || previewActive()) {
         menu.addSeparator();
         menu.addAction(tr("Show whole document"), this, &MainWindow::onShowWholeDocument);
     }
@@ -558,11 +574,86 @@ bool MainWindow::contextElementRange(uint64_t* start, uint64_t* end)
     return true;
 }
 
+PieceTable* MainWindow::activeDocument() const
+{
+    return m_previewTable ? m_previewTable.get() : m_pieceTable.get();
+}
+
+SparseLineIndex* MainWindow::activeIndex() const
+{
+    return m_previewTable ? m_previewIndex.get() : m_lineIndex.get();
+}
+
+// "Parse": show the element on its own, reformatted.
+//
+// The element's source is beautified into a separate in-memory document rather
+// than reformatted in place, so clicking a menu item called Parse never edits
+// the file. That copy is read-only; the real document stays loaded underneath
+// and is what save, search, validation and the tree keep working against.
 void MainWindow::onTreeParseElement()
 {
     uint64_t start = 0, end = 0;
     if (!contextElementRange(&start, &end)) return;
 
+    const uint64_t length = end - start;
+    if (length > kMaxParseBytes) {
+        QMessageBox::warning(this, tr("Parse element"),
+            tr("This element is %1 MB. Reformatting it needs roughly twice that "
+               "in memory.\n\nUse \"Show only this element (raw)\" instead — it "
+               "renders the element without copying it.")
+                .arg(length / (1024 * 1024)));
+        return;
+    }
+
+    auto* model = qobject_cast<VirtualTreeModel*>(m_treeView->model());
+    const QString name = model ? model->tagNameFor(QModelIndex(m_contextIndex)) : QString();
+
+    // Extract the element and beautify it. Works whatever the source layout is,
+    // so a minified document still comes out indented over multiple lines.
+    auto source = std::make_unique<PieceTable>(nullptr);
+    source->appendInitial(m_pieceTable->read(start, length));
+
+    FormatEngine engine;
+    FormatEngine::Options opts;
+    opts.mode = FormatEngine::Mode::Beautify;
+
+    auto formatted = engine.format(*source, opts);
+    if (!formatted) {
+        QMessageBox::warning(this, tr("Parse element"),
+                             tr("Could not reformat <%1>.").arg(name));
+        return;
+    }
+
+    // Swap the viewport onto the preview. The old preview, if any, must not be
+    // freed until the viewport has let go of it.
+    m_viewport->setDocument(nullptr, nullptr);
+
+    m_previewTable = std::move(formatted);
+    m_previewTable->clearUndo();
+    m_previewIndex = std::make_unique<SparseLineIndex>();
+    m_previewIndex->attach(*m_previewTable);
+    m_previewName = name;
+
+    m_viewport->setDocument(m_previewTable.get(), m_previewIndex.get());
+    m_viewport->setReadOnly(true);   // edits here would go nowhere
+    m_viewport->setFocus();
+
+    m_wholeDocAction->setEnabled(true);
+    updateWindowTitle();
+    updateEditActions();
+    statusBar()->showMessage(
+        tr("Parsed <%1> — %2 bytes reformatted to %3 lines. "
+           "View ▸ Show Whole Document to leave.")
+            .arg(name).arg(length).arg(m_previewIndex->lineCount()), 8000);
+}
+
+// The editable counterpart: scope the viewport to the element's live bytes.
+void MainWindow::onTreeShowRawElement()
+{
+    uint64_t start = 0, end = 0;
+    if (!contextElementRange(&start, &end)) return;
+
+    exitPreview();
     m_viewport->setViewRange(start, end);
     m_wholeDocAction->setEnabled(true);
     m_viewport->setFocus();
@@ -570,9 +661,23 @@ void MainWindow::onTreeParseElement()
     auto* model = qobject_cast<VirtualTreeModel*>(m_treeView->model());
     const QString name = model ? model->tagNameFor(QModelIndex(m_contextIndex)) : QString();
     statusBar()->showMessage(
-        tr("Showing <%1> only — %2 bytes. View ▸ Show Whole Document to leave.")
-            .arg(name).arg(end - start), 6000);
+        tr("Showing <%1> only — %2 bytes, still editable. "
+           "View ▸ Show Whole Document to leave.").arg(name).arg(end - start), 6000);
     updateWindowTitle();
+}
+
+void MainWindow::exitPreview()
+{
+    if (!m_previewTable) return;
+
+    m_viewport->setDocument(nullptr, nullptr);
+    m_previewIndex.reset();
+    m_previewTable.reset();
+    m_previewName.clear();
+
+    m_viewport->setDocument(m_pieceTable.get(), m_lineIndex.get());
+    m_viewport->setReadOnly(m_isReadOnly);
+    updateEditActions();
 }
 
 void MainWindow::onTreeCopyElement()
@@ -608,6 +713,7 @@ void MainWindow::onTreeCopyXPath()
 
 void MainWindow::onShowWholeDocument()
 {
+    exitPreview();
     m_viewport->clearViewRange();
     m_wholeDocAction->setEnabled(false);
     updateWindowTitle();
@@ -625,6 +731,9 @@ void MainWindow::searchFor(const QString& term)
 bool MainWindow::findFrom(uint64_t from, bool backwards, bool moveCursor)
 {
     if (!m_pieceTable) return false;
+    // Search covers the whole file, so a match could not be shown inside a
+    // preview of one element.
+    if (previewActive()) { exitPreview(); from = 0; }
 
     const QString term = m_findBar->searchTerm();
     if (term.isEmpty()) {
@@ -1161,7 +1270,8 @@ void MainWindow::updateWindowTitle()
     const QString name = m_currentPath.isEmpty()
         ? tr("Untitled") : QFileInfo(m_currentPath).fileName();
     QString title = QStringLiteral("%1%2 — loxe").arg(name, m_dirty ? QStringLiteral("*") : QString());
-    if (m_viewport && m_viewport->hasViewRange()) title.prepend(tr("[element view] "));
+    if (previewActive())                          title.prepend(tr("[parsed <%1>] ").arg(m_previewName));
+    else if (m_viewport && m_viewport->hasViewRange()) title.prepend(tr("[element view] "));
     if (m_isReadOnly) title.prepend(tr("[read-only] "));
     setWindowTitle(title);
 }

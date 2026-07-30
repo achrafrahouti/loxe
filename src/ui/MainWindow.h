@@ -80,6 +80,7 @@ private slots:
     void onTreeNodeActivated(const QModelIndex& index);
     void onTreeContextMenu(const QPoint& pos);
     void onTreeParseElement();
+    void onTreeShowRawElement();
     void onTreeCopyElement();
     void onTreeCopyXPath();
     void onShowWholeDocument();
@@ -115,6 +116,17 @@ private:
     // Byte range of the element the tree context menu was opened on.
     bool contextElementRange(uint64_t* start, uint64_t* end);
 
+    // Leaves the formatted preview, putting the real document back in the
+    // viewport. Safe to call when no preview is showing.
+    void exitPreview();
+    bool previewActive() const { return m_previewTable != nullptr; }
+
+    // The document the viewport is currently showing: the formatted preview
+    // while one is up, otherwise the real document. Cursor offsets, the
+    // breadcrumb and the attribute panel all refer to this one.
+    PieceTable*      activeDocument() const;
+    SparseLineIndex* activeIndex()    const;
+
     void updateRecentFiles(const QString& path);
     void rebuildRecentFileMenu();
     void updateEditActions();
@@ -130,6 +142,13 @@ private:
     std::unique_ptr<MmapBuffer>      m_mmapBuf;
     std::unique_ptr<PieceTable>      m_pieceTable;
     std::unique_ptr<SparseLineIndex> m_lineIndex;
+
+    // Formatted, read-only copy of a single element shown by "Parse". The real
+    // document above stays loaded and is what saving, search, validation and
+    // the tree keep working against.
+    std::unique_ptr<PieceTable>      m_previewTable;
+    std::unique_ptr<SparseLineIndex> m_previewIndex;
+    QString                          m_previewName;
 
     // Widgets (owned by Qt parent hierarchy)
     ViewportRenderer* m_viewport       = nullptr;
