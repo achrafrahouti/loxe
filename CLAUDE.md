@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**loxe** is a native desktop XML editor for Linux and macOS (spiritual successor to Windows-only *foxe*). It targets arbitrarily large XML files (up to 2 GB) while keeping resident RAM under 80 MB. The project is currently in the **specification phase** — see [requirements.md](requirements.md) for the full SRS.
+**loxe** is a native desktop XML editor for Linux and macOS (spiritual successor to Windows-only *foxe*). It targets arbitrarily large XML files (up to 2 GB) while keeping resident RAM under 80 MB. See [requirements.md](requirements.md) for the full SRS, [DONE.md](DONE.md) for implemented features with measured performance, and [TODO.md](TODO.md) for what is outstanding and for deliberate deviations from the design below.
 
 ## Build Commands
 
@@ -26,7 +26,7 @@ cmake --build build --target test
 
 - **C++17** — minimum standard, no exceptions to this
 - **Qt 6.4+** — Qt5 is explicitly not supported
-- **CMarkup 11.5** — the only permitted XML library; no libxml2, expat, pugixml, or any other
+- **CMarkup 11.5** — the only permitted third-party XML library; no libxml2, expat, pugixml, or any other. Note that the vendored copy exposes **no streaming file API** (`Load()` fails when `MDF_READFILE` is set; there is no public `Open()`), and `SetDoc()` needs the whole document resident. CMarkup is therefore used only for well-formedness validation of documents under 256 MB; all large-document traversal goes through our own `XmlScanner`.
 - **CMake 3.24+** — build system; `vcpkg.json` pins dependency versions
 - **No Scintilla/QScintilla** — text editor is a custom `QWidget` (see `ViewportRenderer`)
 - **No Electron/CEF/web engine** — native Qt widgets only
@@ -34,7 +34,7 @@ cmake --build build --target test
 
 ## Core Architecture
 
-The engine has seven major components that interact in a pipeline:
+The components interact in a pipeline:
 
 ```
 File on disk
@@ -43,19 +43,22 @@ File on disk
                     ├─> SparseLineIndex    — (line, byte_offset) checkpoints every ~4 KB; O(log n) lookup
                     ├─> ViewportRenderer  — QWidget painting only ceil(height/line_height)+2 lines
                     │       └─> IncrementalHighlighter — XML tokeniser over viewport lines only
-                    └─> VirtualTreeModel  — QAbstractItemModel storing (byte_offset, depth, tag_name) only
+                    ├─> XmlScanner        — streaming node tokeniser; holds one node at a time
+                    │       ├─> FormatEngine     — beautify / minify to a bounded sink
+                    │       └─> VirtualTreeModel — QAbstractItemModel storing byte offsets only
+                    └─> SearchEngine      — memmem over overlapping 1 MB windows
                             └─> AsyncLoader — QThread coordinating 3 phases: mmap → SparseLineIndex → tree level-1
 ```
 
-`FormatEngine` is a separate streaming processor that reads through the PieceTable iterator and writes a new PieceTable (never loads the full document into a string).
-
 ### Key design invariants
 
-- **Cursor position** is stored as `{piece_table_offset: uint64_t, visual_column: int}`, not (line, col), so it survives edits.
-- **Tree nodes** store only `byte_offset` — content is fetched by seeking CMarkup to that offset on demand. Children are loaded lazily via `fetchMore()`.
-- **Edits** go through PieceTable only: insert/delete/replace each push an undo record. All operations (beautify, replace-all, encoding change) must be a single undo step.
-- **SparseLineIndex** invalidates and lazily rebuilds checkpoints after the edit position; it must never require a full rescan to answer a lookup.
-- **Thread model**: one writer thread (UI), multiple reader threads allowed via `std::shared_mutex` on PieceTable. Background threads: AsyncLoader, FormatEngine (for large files), Search (for files ≥ 100 MB), validation debounce (500 ms).
+- **Nothing reads the whole document.** Every full-document pass streams in bounded chunks and calls `PieceTable::releasePagesBefore()` as it advances — mapped pages count toward RSS while resident, so an unreleased 2 GB pass blows the memory budget on its own. The two exceptions are deliberate and capped at 256 MB: CMarkup validation and regex search.
+- **Cursor position** is stored as a `uint64_t` byte offset, not (line, col), so it survives edits. Byte↔column conversion happens per visible line via a UTF-16-unit → byte map.
+- **Tree nodes** store only byte offsets, depth and short display strings — never document content. Children are discovered by streaming that element's byte range via `fetchMore()`.
+- **Everything derived from the document reads the PieceTable, not the file.** The line index and the tree both do, so they stay correct after edits. Re-reading the file on disk would show stale content.
+- **Edits** go through PieceTable only: insert/delete/replace each push an undo record holding the piece list from *before* the edit. Compound operations (beautify, replace-all, encoding change) wrap themselves in `beginUndoGroup()`/`endUndoGroup()` to undo in a single step.
+- **SparseLineIndex** invalidates and lazily rebuilds checkpoints after the edit position; it must never require a full rescan to answer a lookup. `attach()` makes it answer lookups before any scan, which is what lets the viewport paint within 1 s on a 2 GB file.
+- **Thread model**: one writer thread (UI), multiple reader threads allowed via `std::shared_mutex` on PieceTable. Background threads: AsyncLoader, FormatEngine (for large files), Search (for files ≥ 100 MB), validation debounce (500 ms). Objects created on a worker thread must `moveToThread()` before being published to the UI.
 
 ### Performance targets (non-negotiable P0)
 
@@ -71,7 +74,16 @@ File on disk
 
 ## Testing
 
-Tests use **Qt Test** (`QTest`). Coverage must include `PieceTable`, `SparseLineIndex`, `MmapBuffer`, and `FormatEngine`. Regression tests open reference files from 1 KB to 2 GB. Memory tests assert resident RSS ≤ 80 MB for 2 GB files (measured via `/proc/self/status` on Linux, `task_info()` on macOS). Fuzz targets use libFuzzer against `IncrementalHighlighter` and `VirtualTreeModel`.
+Tests use **Qt Test** (`QTest`). Every test target runs with `QT_QPA_PLATFORM=offscreen` so the suite works headless. Shared fixtures live in `tests/TestHelpers.h`.
+
+Existing coverage: `MmapBuffer`, `PieceTable`, `SparseLineIndex`, `FormatEngine`, `SearchEngine`, `XmlScanner`, `Encoding`, plus `tst_ViewportEditing`, which drives the editor through real `QTest::keyClick` / `keyClicks` events. The suite must stay clean under the Debug build's ASan + UBSan.
+
+Two conventions worth knowing:
+
+- Performance assertions call `LOXE_SKIP_IF_SANITIZED()` first — ASan is ~10× slower, so a throughput assertion there measures nothing and fails spuriously.
+- The GUI is verified headlessly by rendering it: `loxe FILE --screenshot out.png --screenshot-delay MS`. Use it to confirm anything visual.
+
+Still outstanding: a CI memory assertion for 2 GB files, 1 KB→2 GB regression fixtures, libFuzzer targets for `IncrementalHighlighter` and `VirtualTreeModel`, and benchmark regression alerts. See [TODO.md](TODO.md).
 
 ## Distribution
 

@@ -41,6 +41,10 @@ public:
     // Replace the active color theme.
     void setTheme(const std::vector<QColor>& colors);
 
+    // Built-in palettes, indexed by Token::Kind.
+    static std::vector<QColor> lightTheme();
+    static std::vector<QColor> darkTheme();
+
 private:
     enum class XmlState {
         Content,

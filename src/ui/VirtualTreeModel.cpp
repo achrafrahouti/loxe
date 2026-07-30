@@ -1,41 +1,204 @@
 #include "VirtualTreeModel.h"
-#include "Markup.h"
+#include "../engine/PieceTable.h"
+#include "../engine/XmlScanner.h"
 
 #include <QColor>
 
-// ── CMarkup helpers ──────────────────────────────────────────────────────────
+namespace {
 
-// Navigate a fresh streaming CMarkup to the element described by path (sequence
-// of 0-based sibling indices from just inside the XML root element).
-// Returns true with markup positioned inside the target element.
-static bool navigateTo(CMarkup& markup, const std::vector<int>& path)
+constexpr int kTextPreviewChars = 60;
+constexpr int kAttrValueChars   = 30;
+
+QString qs(std::string_view s)
 {
-    if (!markup.FindElem()) return false;   // XML root element
-    markup.IntoElem();                       // enter root
-    for (int step : path) {
-        for (int j = 0; j <= step; ++j)
-            if (!markup.FindElem()) return false;
-        markup.IntoElem();
-    }
+    return QString::fromUtf8(s.data(), static_cast<qsizetype>(s.size()));
+}
+
+QString attrSummaryOf(std::string_view rawTag)
+{
+    std::string_view name, value;
+    if (!XmlScanner::firstAttribute(rawTag, &name, &value) || name.empty()) return {};
+    return QStringLiteral("[@%1=\"%2\"]").arg(qs(name), qs(value).left(kAttrValueChars));
+}
+
+bool isBlank(std::string_view s)
+{
+    for (char c : s)
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return false;
     return true;
 }
 
-// Return "[@name="value"]" for the first attribute of the current element,
-// or an empty string if none.
-static QString firstAttrSummary(CMarkup& markup)
+// Result of streaming one element's byte range.
+struct ChildScan {
+    std::vector<TreeNode> children;
+    uint64_t              parentEnd = 0;  // just past the parent's end tag
+    QString               parentText;     // parent's own text content
+    bool                  truncated = false;
+};
+
+// Streams the element starting at `startOffset` and collects its *direct*
+// children, together with each child's hasChildren flag, end offset and text
+// preview — all from a single pass over that element's subtree.
+ChildScan collectChildren(const PieceTable& doc, uint64_t startOffset, int parentDepth,
+                          int parentIndex, int maxChildren, uint64_t maxScanBytes,
+                          const std::atomic<bool>* cancelled)
 {
-    std::string name, val;
-    if (!markup.GetNthAttrib(1, name, val) || name.empty()) return {};
-    return QString("[@%1=\"%2\"]")
-        .arg(QString::fromStdString(name))
-        .arg(QString::fromStdString(val).left(30));
+    ChildScan result;
+
+    // relDepth is the nesting level relative to the parent element:
+    // 0 means "a direct child", -1 means the parent's start tag is still pending.
+    int relDepth  = -1;
+    int lastChild = -1;
+
+    const uint64_t scanLimit = (doc.length() - startOffset > maxScanBytes)
+        ? startOffset + maxScanBytes : doc.length();
+
+    XmlScanner::scan(doc, startOffset, scanLimit, [&](const XmlNode& n) {
+        if (relDepth < 0) {
+            if (n.kind == XmlNode::Kind::StartTag) { relDepth = 0; return true; }
+            if (n.kind == XmlNode::Kind::EmptyTag) {
+                result.parentEnd = n.offset + n.raw.size();
+                return false; // no children at all
+            }
+            return true; // skip declaration / comments before the element
+        }
+
+        switch (n.kind) {
+        case XmlNode::Kind::StartTag:
+        case XmlNode::Kind::EmptyTag:
+            if (relDepth == 0) {
+                if (static_cast<int>(result.children.size()) >= maxChildren) {
+                    result.truncated = true;
+                    return false;
+                }
+                TreeNode child;
+                child.byteOffset  = n.offset;
+                child.depth       = parentDepth + 1;
+                child.tagName     = qs(n.name);
+                child.attrSummary = attrSummaryOf(n.raw);
+                child.parentIndex = parentIndex;
+                if (n.kind == XmlNode::Kind::EmptyTag)
+                    child.endOffset = n.offset + n.raw.size();
+                result.children.push_back(std::move(child));
+                lastChild = static_cast<int>(result.children.size()) - 1;
+            } else if (relDepth == 1 && lastChild >= 0) {
+                // A nested element inside the most recent direct child.
+                result.children[static_cast<size_t>(lastChild)].hasChildren = true;
+            }
+            if (n.kind == XmlNode::Kind::StartTag) ++relDepth;
+            break;
+
+        case XmlNode::Kind::EndTag:
+            if (relDepth == 0) {
+                result.parentEnd = n.offset + n.raw.size();
+                return false; // the parent's own end tag: subtree complete
+            }
+            --relDepth;
+            // Back at depth 0 means we just closed the most recent direct child.
+            if (relDepth == 0 && lastChild >= 0)
+                result.children[static_cast<size_t>(lastChild)].endOffset =
+                    n.offset + n.raw.size();
+            break;
+
+        case XmlNode::Kind::Text:
+            if (isBlank(n.raw)) break;
+            if (relDepth == 0) {
+                if (result.parentText.size() < kTextPreviewChars)
+                    result.parentText += qs(n.raw).simplified();
+            } else if (relDepth == 1 && lastChild >= 0) {
+                TreeNode& child = result.children[static_cast<size_t>(lastChild)];
+                if (child.textPreview.size() < kTextPreviewChars)
+                    child.textPreview += qs(n.raw).simplified();
+            }
+            break;
+
+        case XmlNode::Kind::Cdata:
+        case XmlNode::Kind::Comment:
+        case XmlNode::Kind::ProcessingInstruction:
+        case XmlNode::Kind::Doctype:
+            break;
+        }
+        return true;
+    }, cancelled);
+
+    // parentEnd stays 0 when the parent's end tag was never reached, i.e. the
+    // byte budget cut the traversal short.
+    if (result.parentEnd == 0 && scanLimit < doc.length())
+        result.truncated = true;
+
+    for (auto& child : result.children)
+        child.textPreview = child.textPreview.left(kTextPreviewChars);
+    result.parentText = result.parentText.left(kTextPreviewChars);
+    return result;
 }
 
-// ── VirtualTreeModel ─────────────────────────────────────────────────────────
+} // namespace
 
-VirtualTreeModel::VirtualTreeModel(const QString& filePath, QObject* parent)
-    : QAbstractItemModel(parent), m_filePath(filePath)
+VirtualTreeModel::VirtualTreeModel(const PieceTable* doc, QObject* parent)
+    : QAbstractItemModel(parent), m_doc(doc)
 {}
+
+// ── Root scan ────────────────────────────────────────────────────────────────
+
+std::vector<TreeNode> VirtualTreeModel::scanRoots(const PieceTable& doc,
+                                                 const std::atomic<bool>* cancelled)
+{
+    std::vector<TreeNode> nodes;
+
+    // Locate the document element, skipping the declaration, comments and DOCTYPE.
+    TreeNode root;
+    bool     found      = false;
+    bool     selfClosed = false;
+    XmlScanner::scanAll(doc, [&](const XmlNode& n) {
+        if (n.kind != XmlNode::Kind::StartTag && n.kind != XmlNode::Kind::EmptyTag)
+            return true;
+        root.byteOffset  = n.offset;
+        root.depth       = 0;
+        root.tagName     = qs(n.name);
+        root.attrSummary = attrSummaryOf(n.raw);
+        root.parentIndex = -1;
+        selfClosed       = (n.kind == XmlNode::Kind::EmptyTag);
+        found            = true;
+        return false;
+    }, cancelled);
+
+    if (!found) return nodes;
+
+    if (selfClosed) {
+        root.endOffset = root.byteOffset;
+        root.isLoaded  = true;
+        nodes.push_back(std::move(root));
+        return nodes;
+    }
+
+    // Enumerate level 1 up front, on this (worker) thread.
+    ChildScan scan = collectChildren(doc, root.byteOffset, /*parentDepth=*/0,
+                                     /*parentIndex=*/0, kMaxChildrenPerNode,
+                                     kMaxScanBytes, cancelled);
+
+    root.endOffset   = scan.parentEnd;
+    root.textPreview = scan.parentText;
+    root.truncated   = scan.truncated;
+    root.hasChildren = !scan.children.empty();
+    root.isLoaded    = true;
+    nodes.push_back(std::move(root));
+
+    // Append the children and wire the sibling chain.
+    const int base = 1;
+    for (size_t i = 0; i < scan.children.size(); ++i) {
+        nodes.push_back(std::move(scan.children[i]));
+        if (i == 0) nodes[0].firstChild = base;
+        else        nodes[base + static_cast<int>(i) - 1].nextSibling = base + static_cast<int>(i);
+    }
+    return nodes;
+}
+
+void VirtualTreeModel::setInitialNodes(std::vector<TreeNode> nodes)
+{
+    beginResetModel();
+    m_nodes = std::move(nodes);
+    endResetModel();
+}
 
 void VirtualTreeModel::appendRootNodes(std::vector<TreeNode> nodes)
 {
@@ -49,12 +212,12 @@ void VirtualTreeModel::appendRootNodes(std::vector<TreeNode> nodes)
 // ── QAbstractItemModel ───────────────────────────────────────────────────────
 
 QModelIndex VirtualTreeModel::index(int row, int column,
-                                     const QModelIndex& parent) const
+                                    const QModelIndex& parent) const
 {
     if (!hasIndex(row, column, parent)) return {};
 
     if (!parent.isValid()) {
-        // Root items: find the row-th node with parentIndex == -1
+        // Root items: the row-th node with parentIndex == -1.
         int count = 0;
         for (int i = 0; i < static_cast<int>(m_nodes.size()); ++i) {
             if (m_nodes[i].parentIndex == -1) {
@@ -65,7 +228,7 @@ QModelIndex VirtualTreeModel::index(int row, int column,
         return {};
     }
 
-    // Child items: walk firstChild → nextSibling chain
+    // Child items: walk the firstChild → nextSibling chain.
     const int pni      = nodeIndexOf(parent);
     int       childIdx = m_nodes[pni].firstChild;
     for (int i = 0; i < row; ++i) {
@@ -80,6 +243,7 @@ QModelIndex VirtualTreeModel::parent(const QModelIndex& child) const
 {
     if (!child.isValid()) return {};
     const int nodeIdx   = nodeIndexOf(child);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return {};
     const int parentIdx = m_nodes[nodeIdx].parentIndex;
     if (parentIdx < 0) return {};
     return createIndex(rowOfNode(parentIdx), 0, parentIdx);
@@ -94,7 +258,9 @@ int VirtualTreeModel::rowCount(const QModelIndex& parent) const
         return count;
     }
     const int nodeIdx = nodeIndexOf(parent);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return 0;
     if (!m_nodes[nodeIdx].isLoaded) return 0;
+
     int count = 0;
     int child = m_nodes[nodeIdx].firstChild;
     while (child != -1) { ++count; child = m_nodes[child].nextSibling; }
@@ -106,28 +272,35 @@ int VirtualTreeModel::columnCount(const QModelIndex&) const { return 3; }
 QVariant VirtualTreeModel::data(const QModelIndex& index, int role) const
 {
     if (!index.isValid()) return {};
-    const auto& node = m_nodes[nodeIndexOf(index)];
+    const int nodeIdx = nodeIndexOf(index);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return {};
+    const auto& node = m_nodes[nodeIdx];
 
     if (role == Qt::DisplayRole) {
         switch (index.column()) {
-        case 0: return node.tagName;
+        case 0: return node.truncated
+                    ? QStringLiteral("%1  (partial — %2 children shown)")
+                          .arg(node.tagName).arg(rowCount(index))
+                    : node.tagName;
         case 1: return node.attrSummary;
         case 2: return node.textPreview;
         }
     }
+    if (role == Qt::ToolTipRole)
+        return QStringLiteral("<%1> at byte %2").arg(node.tagName).arg(node.byteOffset);
     if (role == Qt::ForegroundRole && index.column() == 0)
         return QColor(0x00, 0x55, 0xAA);
     return {};
 }
 
 QVariant VirtualTreeModel::headerData(int section, Qt::Orientation orientation,
-                                       int role) const
+                                      int role) const
 {
     if (orientation != Qt::Horizontal || role != Qt::DisplayRole) return {};
     switch (section) {
-    case 0: return "Element";
-    case 1: return "Attributes";
-    case 2: return "Text";
+    case 0: return tr("Element");
+    case 1: return tr("Attributes");
+    case 2: return tr("Text");
     }
     return {};
 }
@@ -135,13 +308,17 @@ QVariant VirtualTreeModel::headerData(int section, Qt::Orientation orientation,
 bool VirtualTreeModel::hasChildren(const QModelIndex& parent) const
 {
     if (!parent.isValid()) return !m_nodes.empty();
-    return m_nodes[nodeIndexOf(parent)].hasChildren;
+    const int nodeIdx = nodeIndexOf(parent);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return false;
+    return m_nodes[nodeIdx].hasChildren;
 }
 
 bool VirtualTreeModel::canFetchMore(const QModelIndex& parent) const
 {
     if (!parent.isValid()) return false;
-    const auto& node = m_nodes[nodeIndexOf(parent)];
+    const int nodeIdx = nodeIndexOf(parent);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return false;
+    const auto& node = m_nodes[nodeIdx];
     return node.hasChildren && !node.isLoaded;
 }
 
@@ -154,52 +331,45 @@ void VirtualTreeModel::fetchMore(const QModelIndex& parent)
 uint64_t VirtualTreeModel::byteOffsetFor(const QModelIndex& index) const
 {
     if (!index.isValid()) return 0;
-    return m_nodes[nodeIndexOf(index)].byteOffset;
+    const int nodeIdx = nodeIndexOf(index);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return 0;
+    return m_nodes[nodeIdx].byteOffset;
+}
+
+QModelIndex VirtualTreeModel::indexForOffset(uint64_t offset) const
+{
+    // Descend through loaded nodes only: following the caret must never trigger
+    // a scan, or scrolling a large document would stall.
+    int best = -1;
+    for (int i = 0; i < static_cast<int>(m_nodes.size()); ++i) {
+        const auto& n = m_nodes[i];
+        if (offset < n.byteOffset) continue;
+        if (n.endOffset != 0 && offset >= n.endOffset) continue;
+        if (best < 0 || n.depth > m_nodes[best].depth) best = i;
+    }
+    if (best < 0) return {};
+    return createIndex(rowOfNode(best), 0, best);
 }
 
 // ── Private ──────────────────────────────────────────────────────────────────
 
 void VirtualTreeModel::loadChildren(int nodeIndex)
 {
-    CMarkup markup(CMarkup::MDF_READFILE);
-    if (!markup.Load(m_filePath.toStdString())) {
-        m_nodes[nodeIndex].isLoaded = true;
-        return;
-    }
+    if (!m_doc) { m_nodes[nodeIndex].isLoaded = true; return; }
 
-    if (!navigateTo(markup, m_nodes[nodeIndex].navPath)) {
-        m_nodes[nodeIndex].isLoaded = true;
-        return;
-    }
+    ChildScan scan = collectChildren(*m_doc, m_nodes[nodeIndex].byteOffset,
+                                     m_nodes[nodeIndex].depth, nodeIndex,
+                                     kMaxChildrenPerNode, kMaxScanBytes, nullptr);
+    std::vector<TreeNode>& batch = scan.children;
 
-    // Collect children at this level
-    std::vector<TreeNode> batch;
-    int sibIdx = 0;
-    while (markup.FindElem()) {
-        TreeNode child;
-        child.tagName     = QString::fromStdString(markup.GetTagName());
-        child.attrSummary = firstAttrSummary(markup);
-
-        const std::string preview = markup.GetData();
-        if (!preview.empty())
-            child.textPreview = QString::fromUtf8(preview.c_str()).simplified().left(60);
-
-        child.depth       = m_nodes[nodeIndex].depth + 1;
-        child.parentIndex = nodeIndex;
-        child.navPath     = m_nodes[nodeIndex].navPath;
-        child.navPath.push_back(sibIdx);
-
-        // Peek inside to determine hasChildren, then step back out
-        markup.IntoElem();
-        child.hasChildren = markup.FindElem();
-        markup.OutOfElem();
-
-        batch.push_back(std::move(child));
-        ++sibIdx;
-    }
+    m_nodes[nodeIndex].endOffset   = scan.parentEnd;
+    m_nodes[nodeIndex].textPreview = scan.parentText;
+    m_nodes[nodeIndex].truncated   = scan.truncated;
 
     if (batch.empty()) {
-        m_nodes[nodeIndex].isLoaded = true;
+        // No element children after all — drop the expander.
+        m_nodes[nodeIndex].isLoaded    = true;
+        m_nodes[nodeIndex].hasChildren = false;
         return;
     }
 
@@ -208,11 +378,9 @@ void VirtualTreeModel::loadChildren(int nodeIndex)
 
     const int base = static_cast<int>(m_nodes.size());
     for (int i = 0; i < static_cast<int>(batch.size()); ++i) {
-        m_nodes.push_back(std::move(batch[i]));
-        if (i == 0)
-            m_nodes[nodeIndex].firstChild = base;
-        else
-            m_nodes[base + i - 1].nextSibling = base + i;
+        m_nodes.push_back(std::move(batch[static_cast<size_t>(i)]));
+        if (i == 0) m_nodes[nodeIndex].firstChild = base;
+        else        m_nodes[base + i - 1].nextSibling = base + i;
     }
     m_nodes[nodeIndex].isLoaded = true;
 

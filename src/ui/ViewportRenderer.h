@@ -1,16 +1,21 @@
 #pragma once
 
-#include <QScrollBar>
+#include <QFont>
+#include <QString>
 #include <QWidget>
 #include <cstdint>
+#include <vector>
 
 class PieceTable;
 class SparseLineIndex;
 class IncrementalHighlighter;
+class QScrollBar;
+class QTimer;
 
 // Custom QWidget that paints only the visible lines of the document (~40–80).
-// Cursor position is stored as a byte offset, not (line, col), so it survives edits.
-// Emits cursorMoved() on every cursor movement for the tree view and breadcrumb.
+// Cursor position is stored as a byte offset, not (line, col), so it survives
+// edits. Emits cursorMoved() on every cursor movement for the tree view and
+// breadcrumb, and documentEdited() whenever the PieceTable is mutated.
 class ViewportRenderer : public QWidget {
     Q_OBJECT
 public:
@@ -19,38 +24,114 @@ public:
 
     void setDocument(PieceTable* table, SparseLineIndex* index);
 
-    uint64_t cursorOffset()     const { return m_cursorOffset; }
-    int      tabWidth()         const { return m_tabWidth; }
-    bool     wordWrap()         const { return m_wordWrap; }
+    uint64_t cursorOffset() const { return m_cursorOffset; }
+    int      tabWidth()     const { return m_tabWidth; }
+    bool     wordWrap()     const { return m_wordWrap; }
+    bool     isReadOnly()   const { return m_readOnly; }
 
-    void setCursorOffset(uint64_t offset);
+    void setCursorOffset(uint64_t offset, bool extendSelection = false);
     void setTabWidth(int spaces);
     void setWordWrap(bool on);
     void setColumnMarkers(int col1, int col2); // 0 to disable
+    void setReadOnly(bool on);
+    void setEditorFont(const QFont& font);
+    void setDarkTheme(bool on);
+
+    // Selection, as an ordered byte range. Empty when there is no selection.
+    bool     hasSelection() const { return m_selAnchor != m_cursorOffset && m_selValid; }
+    uint64_t selectionStart() const;
+    uint64_t selectionEnd()   const;
+    void     clearSelection();
+    void     selectRange(uint64_t start, uint64_t end);
+    QString  selectedText() const;
+
+    // Highlight a range without moving the selection (used for search matches).
+    void setMatchHighlight(uint64_t start, uint64_t length);
+    void clearMatchHighlight();
+
+    // Line the cursor is on, 0-based.
+    uint64_t cursorLine() const;
+    // Visual column of the cursor, 0-based, with tabs expanded.
+    int cursorColumn() const;
+
+    void ensureCursorVisible();
+
+    // --- Editing (no-ops when read-only) ---
+    void insertText(const QString& text);
+    void deleteSelection();
+    void backspace();
+    void deleteForward();
+    void cut();
+    void copy();
+    void paste();
+    void selectAll();
+    void undo();
+    void redo();
 
 signals:
     void cursorMoved(uint64_t byteOffset);
+    // Emitted after any mutation; offset is the earliest byte changed.
+    void documentEdited(uint64_t offset);
+    void selectionChanged();
 
 protected:
     void paintEvent(QPaintEvent*) override;
     void keyPressEvent(QKeyEvent*) override;
     void mousePressEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
+    void mouseReleaseEvent(QMouseEvent*) override;
+    void mouseDoubleClickEvent(QMouseEvent*) override;
     void wheelEvent(QWheelEvent*) override;
     void resizeEvent(QResizeEvent*) override;
+    void focusInEvent(QFocusEvent*) override;
+    void focusOutEvent(QFocusEvent*) override;
 
 private:
-    // Number of lines that fit in the widget (ceil(height/lineHeight) + 2).
-    int visibleLineCount() const;
+    // A visible line, decoded for painting with a byte↔column mapping so that
+    // cursor offsets stay exact for multi-byte UTF-8 and tabs.
+    struct VisualLine {
+        uint64_t         startOffset = 0; // document offset of the first byte
+        uint64_t         byteLength  = 0; // bytes excluding the newline
+        QString          text;            // decoded, tabs left as '\t'
+        std::vector<int> unitToByte;       // size text.size()+1
+    };
 
-    // Fetch up to visibleLineCount()+2 lines from PieceTable via SparseLineIndex.
-    std::vector<QString> fetchVisibleLines() const;
+    int  visibleLineCount() const;
+    void rebuildVisibleLines();
+    void invalidateLines();
+
+    // Lines above the viewport that establish highlighter state.
+    std::vector<QString> contextLines() const;
+
+    VisualLine buildLine(uint64_t lineNumber) const;
+    // The cached line containing `offset`, or nullptr when it is off-screen.
+    const VisualLine* lineForOffset(uint64_t offset) const;
 
     void scrollToLine(uint64_t line);
     void updateScrollBars();
 
-    // Pixel x-coordinate of the gutter right edge.
     int gutterWidth() const;
+    int textOriginX() const; // gutter width minus horizontal scroll
+
+    // Pixel x of a UTF-16 unit index within a line, tabs expanded.
+    int  xForUnit(const VisualLine& line, int unit) const;
+    // Nearest UTF-16 unit index for a pixel x within a line.
+    int  unitForX(const VisualLine& line, int x) const;
+    // Expand tabs so painting and hit-testing agree on cell positions.
+    QString expandTabs(const QString& s, std::vector<int>* unitToCell = nullptr) const;
+
+    uint64_t offsetAtPoint(const QPoint& pos) const;
+    // Byte offset of the start of the word around `offset`, and its end.
+    void wordBoundsAt(uint64_t offset, uint64_t* start, uint64_t* end) const;
+
+    void moveCursor(uint64_t offset, bool extendSelection);
+    void applyEdit(uint64_t offset); // shared post-mutation bookkeeping
+
+    // Previous / next byte offset respecting UTF-8 sequence boundaries.
+    uint64_t prevCharOffset(uint64_t offset) const;
+    uint64_t nextCharOffset(uint64_t offset) const;
+
+    uint64_t documentLength() const;
 
     PieceTable*             m_table       = nullptr;
     SparseLineIndex*        m_index       = nullptr;
@@ -58,13 +139,33 @@ private:
 
     uint64_t m_firstVisibleLine = 0;
     uint64_t m_cursorOffset     = 0;
-    int      m_cursorVisualCol  = 0;
-    int      m_tabWidth         = 4;
-    bool     m_wordWrap         = false;
-    int      m_colMarker1       = 80;
-    int      m_colMarker2       = 120;
-    int      m_lineHeight       = 0; // computed on first paint
+    uint64_t m_selAnchor        = 0;
+    bool     m_selValid         = false;
+    // Column the cursor "wants" when moving vertically through short lines.
+    int      m_stickyColumn     = -1;
+
+    uint64_t m_matchStart  = 0;
+    uint64_t m_matchLength = 0;
+
+    int  m_tabWidth   = 4;
+    bool m_wordWrap   = false;
+    int  m_colMarker1 = 80;
+    int  m_colMarker2 = 120;
+    bool m_readOnly   = false;
+    bool m_darkTheme  = false;
+
+    QFont m_font;
+    int   m_lineHeight  = 0;
+    int   m_charWidth   = 0;
+    int   m_ascent      = 0;
+
+    bool m_caretVisible = true;
+    bool m_selecting    = false;
+
+    mutable std::vector<VisualLine> m_lines;
+    mutable bool                    m_linesValid = false;
 
     QScrollBar* m_vScroll = nullptr;
     QScrollBar* m_hScroll = nullptr;
+    QTimer*     m_caretTimer = nullptr;
 };
