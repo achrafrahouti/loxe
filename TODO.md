@@ -37,6 +37,9 @@ are not "fixed" by accident.
   is reached by scrolling right. Column reporting past the decoded window is not
   yet exact, and `Ctrl+End` on a single-line 500 MB document costs ~20 ms.
   Word wrap (TVP-12) is the real fix for reading minified files comfortably.
+- **The breadcrumb needs the enclosing elements to close within 1 MB** of the
+  cursor. Deep inside a very large element the chain is reported truncated and
+  prefixed with "…" rather than guessed at.
 - **Validation reports at most 100 diagnostics**, and a *fatal* parse error
   stops libxml2 at the first complaint — so a badly broken document shows one
   error, not a list. Non-fatal errors (undefined namespace prefixes, say)
@@ -93,6 +96,10 @@ are not "fixed" by accident.
 - [ ] Fuzz target via libFuzzer
 
 ### MainWindow
+- [ ] Tree context menu: add *Delete element* and *Copy element without children*
+- [ ] Scoped view is entered from the tree only; no way to scope from the caret
+- [ ] `tst_MainWindow` does not exist, so the context-menu actions are covered
+      only through `ViewportRenderer`/`VirtualTreeModel` unit tests
 - [ ] Attribute panel in-place editing committing to the PieceTable
 - [ ] Breadcrumb segments clickable to jump to the ancestor element
 - [ ] XPath 1.0 search (Ctrl+Shift+F) with tree + viewport highlight
@@ -145,6 +152,8 @@ are not "fixed" by accident.
       `tst_FormatEngine`, `tst_SearchEngine`, `tst_XmlScanner`, `tst_Encoding`,
       `tst_Validator`
 - [x] UI smoke tests driving real key and mouse events (`tst_ViewportEditing`)
+- [x] `tst_XmlContext` covering the breadcrumb failures (unclosed elements,
+      comments, CDATA, angle brackets inside attribute values)
 - [x] Round-trip test: open → beautify → save → reopen byte-identical
 - [x] Clean under ASan + UBSan with leak detection
 - [ ] Memory assertions in CI: RSS ≤ 80 MB for a 2 GB file (verified manually

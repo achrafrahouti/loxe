@@ -3,6 +3,9 @@
 #include "../engine/XmlScanner.h"
 
 #include <QColor>
+#include <QStringList>
+
+#include <algorithm>
 
 namespace {
 
@@ -334,6 +337,108 @@ uint64_t VirtualTreeModel::byteOffsetFor(const QModelIndex& index) const
     const int nodeIdx = nodeIndexOf(index);
     if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return 0;
     return m_nodes[nodeIdx].byteOffset;
+}
+
+bool VirtualTreeModel::elementRange(const QModelIndex& index,
+                                    uint64_t* start, uint64_t* end) const
+{
+    if (!index.isValid() || !m_doc) return false;
+    const int nodeIdx = nodeIndexOf(index);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return false;
+
+    const TreeNode& node = m_nodes[nodeIdx];
+    *start = node.byteOffset;
+
+    if (node.endOffset > node.byteOffset) { *end = node.endOffset; return true; }
+
+    // Not known yet: walk the element's own subtree until its end tag, tracking
+    // nesting so a same-named descendant cannot close it early.
+    uint64_t found    = 0;
+    int      relDepth = -1;
+    const uint64_t limit = std::min(m_doc->length(), node.byteOffset + kMaxScanBytes);
+
+    XmlScanner::scan(*m_doc, node.byteOffset, limit, [&](const XmlNode& n) {
+        if (relDepth < 0) {
+            if (n.kind == XmlNode::Kind::EmptyTag) {
+                found = n.offset + n.raw.size();
+                return false;
+            }
+            if (n.kind == XmlNode::Kind::StartTag) { relDepth = 0; return true; }
+            return true;
+        }
+        if (n.kind == XmlNode::Kind::StartTag) ++relDepth;
+        else if (n.kind == XmlNode::Kind::EndTag) {
+            if (relDepth == 0) { found = n.offset + n.raw.size(); return false; }
+            --relDepth;
+        }
+        return true;
+    });
+
+    if (found <= node.byteOffset) return false;
+
+    // Cache it so a repeat request is free.
+    const_cast<TreeNode&>(node).endOffset = found;
+    *end = found;
+    return true;
+}
+
+QString VirtualTreeModel::tagNameFor(const QModelIndex& index) const
+{
+    if (!index.isValid()) return {};
+    const int nodeIdx = nodeIndexOf(index);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return {};
+    return m_nodes[nodeIdx].tagName;
+}
+
+QString VirtualTreeModel::xpathFor(const QModelIndex& index) const
+{
+    if (!index.isValid()) return {};
+    int nodeIdx = nodeIndexOf(index);
+    if (nodeIdx < 0 || nodeIdx >= static_cast<int>(m_nodes.size())) return {};
+
+    QStringList parts;
+    while (nodeIdx >= 0) {
+        const TreeNode& node = m_nodes[nodeIdx];
+
+        // Position among siblings sharing this element name. Only emit the
+        // predicate when the name actually repeats, keeping paths readable.
+        int position = 1;
+        int sameName = 0;
+        const int parentIdx = node.parentIndex;
+        int sib = (parentIdx < 0)
+            ? firstRootNode()
+            : m_nodes[parentIdx].firstChild;
+        bool beforeSelf = true;
+        while (sib != -1) {
+            if (m_nodes[sib].tagName == node.tagName) {
+                ++sameName;
+                if (beforeSelf && sib != nodeIdx) ++position;
+            }
+            if (sib == nodeIdx) beforeSelf = false;
+            sib = (parentIdx < 0) ? nextRootNode(sib) : m_nodes[sib].nextSibling;
+        }
+
+        parts.prepend(sameName > 1
+            ? QStringLiteral("%1[%2]").arg(node.tagName).arg(position)
+            : node.tagName);
+        nodeIdx = node.parentIndex;
+    }
+
+    return QStringLiteral("/") + parts.join(QLatin1Char('/'));
+}
+
+int VirtualTreeModel::firstRootNode() const
+{
+    for (int i = 0; i < static_cast<int>(m_nodes.size()); ++i)
+        if (m_nodes[i].parentIndex == -1) return i;
+    return -1;
+}
+
+int VirtualTreeModel::nextRootNode(int from) const
+{
+    for (int i = from + 1; i < static_cast<int>(m_nodes.size()); ++i)
+        if (m_nodes[i].parentIndex == -1) return i;
+    return -1;
 }
 
 QModelIndex VirtualTreeModel::indexForOffset(uint64_t offset) const

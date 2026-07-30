@@ -113,6 +113,9 @@ void ViewportRenderer::setDocument(PieceTable* table, SparseLineIndex* index)
 {
     m_table            = table;
     m_index            = index;
+    m_rangeActive      = false;
+    m_rangeStart       = 0;
+    m_rangeEnd         = 0;
     m_firstVisibleLine = 0;
     m_cursorOffset     = 0;
     m_selAnchor        = 0;
@@ -165,9 +168,64 @@ void ViewportRenderer::setDarkTheme(bool on)
     update();
 }
 
-uint64_t ViewportRenderer::documentLength() const
+uint64_t ViewportRenderer::rawDocumentLength() const
 {
     return m_table ? m_table->length() : 0;
+}
+
+uint64_t ViewportRenderer::documentLength() const
+{
+    const uint64_t raw = rawDocumentLength();
+    return m_rangeActive ? std::min(m_rangeEnd, raw) : raw;
+}
+
+uint64_t ViewportRenderer::viewRangeStart() const
+{
+    return m_rangeActive ? std::min(m_rangeStart, rawDocumentLength()) : 0;
+}
+
+uint64_t ViewportRenderer::viewRangeEnd() const
+{
+    return m_rangeActive ? std::min(m_rangeEnd, rawDocumentLength()) : rawDocumentLength();
+}
+
+void ViewportRenderer::setViewRange(uint64_t start, uint64_t end)
+{
+    const uint64_t raw = rawDocumentLength();
+    start = std::min(start, raw);
+    end   = std::min(std::max(end, start), raw);
+
+    m_rangeActive = true;
+    m_rangeStart  = start;
+    m_rangeEnd    = end;
+
+    m_cursorOffset = start;
+    m_selAnchor    = start;
+    m_selValid     = false;
+    m_stickyColumn = -1;
+    clearMatchHighlight();
+
+    invalidateLines();
+    // Scroll to the first line of the scope.
+    if (m_index) {
+        m_firstVisibleLine = m_index->offsetToLine(start);
+        m_vScroll->setValue(static_cast<int>(std::min<uint64_t>(m_firstVisibleLine, INT32_MAX)));
+    }
+    updateScrollBars();
+    update();
+    emit cursorMoved(m_cursorOffset);
+}
+
+void ViewportRenderer::clearViewRange()
+{
+    if (!m_rangeActive) return;
+    m_rangeActive = false;
+    m_rangeStart  = 0;
+    m_rangeEnd    = 0;
+    invalidateLines();
+    updateScrollBars();
+    update();
+    emit cursorMoved(m_cursorOffset);
 }
 
 // --- Selection ---
@@ -192,8 +250,11 @@ void ViewportRenderer::clearSelection()
 
 void ViewportRenderer::selectRange(uint64_t start, uint64_t end)
 {
-    m_selAnchor    = start;
-    m_cursorOffset = end;
+    // A scoped view must not be able to select outside the element it shows.
+    const uint64_t lo = viewRangeStart();
+    const uint64_t hi = documentLength();
+    m_selAnchor    = std::clamp(start, lo, hi);
+    m_cursorOffset = std::clamp(end, lo, hi);
     m_selValid     = true;
     ensureCursorVisible();
     update();
@@ -246,11 +307,12 @@ int ViewportRenderer::cursorColumn() const
 
 void ViewportRenderer::setCursorOffset(uint64_t offset, bool extendSelection)
 {
-    moveCursor(std::min(offset, documentLength()), extendSelection);
+    moveCursor(std::clamp(offset, viewRangeStart(), documentLength()), extendSelection);
 }
 
 void ViewportRenderer::moveCursor(uint64_t offset, bool extendSelection)
 {
+    offset = std::clamp(offset, viewRangeStart(), documentLength());
     if (extendSelection) {
         if (!m_selValid) { m_selAnchor = m_cursorOffset; m_selValid = true; }
     } else {
@@ -542,8 +604,20 @@ void ViewportRenderer::keyPressEvent(QKeyEvent* e)
 
 // --- Editing ---
 
-void ViewportRenderer::applyEdit(uint64_t offset)
+void ViewportRenderer::applyEdit(uint64_t offset, int64_t delta)
 {
+    // Keep a scoped view covering the same element after its content grows or
+    // shrinks; an edit before the scope shifts both ends.
+    if (m_rangeActive && delta != 0) {
+        if (offset < m_rangeStart)
+            m_rangeStart = static_cast<uint64_t>(std::max<int64_t>(
+                0, static_cast<int64_t>(m_rangeStart) + delta));
+        if (offset <= m_rangeEnd)
+            m_rangeEnd = static_cast<uint64_t>(std::max<int64_t>(
+                static_cast<int64_t>(m_rangeStart),
+                static_cast<int64_t>(m_rangeEnd) + delta));
+    }
+
     if (m_index) m_index->invalidateFrom(offset);
     invalidateLines();
     updateScrollBars();
@@ -562,6 +636,7 @@ void ViewportRenderer::insertText(const QString& text)
 
     const QByteArray utf8 = text.toUtf8();
     uint64_t at = m_cursorOffset;
+    const uint64_t lengthBefore = rawDocumentLength();
 
     if (hasSelection()) {
         // Replacing a selection must undo in one step.
@@ -576,7 +651,7 @@ void ViewportRenderer::insertText(const QString& text)
 
     m_cursorOffset = at + static_cast<uint64_t>(utf8.size());
     m_selAnchor    = m_cursorOffset;
-    applyEdit(at);
+    applyEdit(at, static_cast<int64_t>(rawDocumentLength()) - static_cast<int64_t>(lengthBefore));
 }
 
 void ViewportRenderer::deleteSelection()
@@ -588,7 +663,7 @@ void ViewportRenderer::deleteSelection()
     m_cursorOffset = s;
     m_selAnchor    = s;
     m_selValid     = false;
-    applyEdit(s);
+    applyEdit(s, -static_cast<int64_t>(e - s));
 }
 
 void ViewportRenderer::backspace()
@@ -603,10 +678,11 @@ void ViewportRenderer::backspace()
         && m_table->read(from, 1) == "\n" && m_table->read(from - 1, 1) == "\r") {
         --from;
     }
-    m_table->remove(from, m_cursorOffset - from);
+    const uint64_t removed = m_cursorOffset - from;
+    m_table->remove(from, removed);
     m_cursorOffset = from;
     m_selAnchor    = from;
-    applyEdit(from);
+    applyEdit(from, -static_cast<int64_t>(removed));
 }
 
 void ViewportRenderer::deleteForward()
@@ -621,7 +697,7 @@ void ViewportRenderer::deleteForward()
     if (m_table->read(m_cursorOffset, 1) == "\r" && to < docLen && m_table->read(to, 1) == "\n")
         ++to;
     m_table->remove(m_cursorOffset, to - m_cursorOffset);
-    applyEdit(m_cursorOffset);
+    applyEdit(m_cursorOffset, -static_cast<int64_t>(to - m_cursorOffset));
 }
 
 void ViewportRenderer::cut()
@@ -647,7 +723,7 @@ void ViewportRenderer::paste()
 void ViewportRenderer::selectAll()
 {
     if (!m_table) return;
-    selectRange(0, documentLength());
+    selectRange(viewRangeStart(), documentLength());
 }
 
 void ViewportRenderer::undo()
@@ -658,8 +734,10 @@ void ViewportRenderer::undo()
     m_cursorOffset = std::min(cursor, documentLength());
     m_selAnchor    = m_cursorOffset;
     m_selValid     = false;
-    // The piece list changed wholesale, so every checkpoint may be stale.
-    applyEdit(0);
+    // The piece list changed wholesale, so every checkpoint may be stale — and
+    // a scoped range can no longer be trusted to still bound the same element.
+    clearViewRange();
+    applyEdit(0, 0);
 }
 
 void ViewportRenderer::redo()
@@ -670,7 +748,8 @@ void ViewportRenderer::redo()
     m_cursorOffset = std::min(cursor, documentLength());
     m_selAnchor    = m_cursorOffset;
     m_selValid     = false;
-    applyEdit(0);
+    clearViewRange();
+    applyEdit(0, 0);
 }
 
 // --- Mouse ---
@@ -779,7 +858,7 @@ ViewportRenderer::VisualLine ViewportRenderer::decodeLineAt(uint64_t start,
         return line;
     }
 
-    const uint64_t docLen = documentLength();
+    const uint64_t docLen = documentLength(); // scope end when scoped
 
     // A cell is at least one byte, so budgeting in bytes never under-reads; the
     // x4 covers the worst case of every cell being a 4-byte UTF-8 sequence.
@@ -789,7 +868,8 @@ ViewportRenderer::VisualLine ViewportRenderer::decodeLineAt(uint64_t start,
     uint64_t    pos        = start;
     bool        sawNewline = false;
     while (pos < docLen && raw.size() < maxBytes) {
-        std::string chunk = m_table->read(pos, 8192);
+        const uint64_t want = std::min<uint64_t>(8192, docLen - pos);
+        std::string chunk = m_table->read(pos, want);
         if (chunk.empty()) break;
         const size_t nl = chunk.find('\n');
         if (nl != std::string::npos) {
@@ -837,20 +917,27 @@ void ViewportRenderer::rebuildVisibleLines()
     m_lines.clear();
     if (!m_table || !m_index) { m_linesValid = true; return; }
 
-    const int      count  = visibleLineCount();
-    const int      budget = lineCellBudget();
-    const uint64_t docLen = documentLength();
+    const int      count    = visibleLineCount();
+    const int      budget   = lineCellBudget();
+    const uint64_t docLen   = documentLength();
+    const uint64_t rangeTop = viewRangeStart();
     const uint64_t lastLine = m_index->offsetToLine(docLen);
     m_lines.reserve(static_cast<size_t>(count));
 
     // Walk by line number rather than by "where the previous read stopped". A
     // clipped line is still a single line, so its remainder must not be shown
     // as extra rows with invented line numbers.
+    const uint64_t firstScopeLine = m_rangeActive ? m_index->offsetToLine(rangeTop) : 0;
+
     for (int i = 0; i < count; ++i) {
         const uint64_t lineNum = m_firstVisibleLine + static_cast<uint64_t>(i);
         if (lineNum > lastLine) break;
+        if (lineNum < firstScopeLine) continue;
 
-        const uint64_t start = m_index->lineToOffset(lineNum);
+        uint64_t start = m_index->lineToOffset(lineNum);
+        if (start > docLen) break;
+        // A scoped view starts mid-line when the element does.
+        start = std::max(start, rangeTop);
         if (start > docLen) break;
 
         m_lines.push_back(decodeLineAt(start, budget));
@@ -1042,12 +1129,27 @@ void ViewportRenderer::updateScrollBars()
         return;
     }
 
-    const uint64_t lines   = m_index->estimatedLineCount();
-    const int      visible = std::max(1, visibleLineCount() - 2);
-    const auto     maxLine = static_cast<int>(
-        std::min<uint64_t>(lines > static_cast<uint64_t>(visible) ? lines - visible : 0, INT32_MAX));
+    const int visible = std::max(1, visibleLineCount() - 2);
 
-    m_vScroll->setRange(0, maxLine);
+    // The scroll bar works in absolute line numbers throughout, so a scoped
+    // view simply narrows its range rather than needing an index remap.
+    uint64_t firstLine = 0;
+    uint64_t lastLine  = 0;
+    if (m_rangeActive) {
+        firstLine = m_index->offsetToLine(viewRangeStart());
+        lastLine  = m_index->offsetToLine(documentLength());
+    } else {
+        const uint64_t lines = m_index->estimatedLineCount();
+        lastLine = (lines > 0) ? lines - 1 : 0;
+    }
+    if (lastLine < firstLine) lastLine = firstLine;
+
+    const uint64_t span    = lastLine - firstLine + 1;
+    const uint64_t maxTop  = firstLine
+        + (span > static_cast<uint64_t>(visible) ? span - static_cast<uint64_t>(visible) : 0);
+
+    m_vScroll->setRange(static_cast<int>(std::min<uint64_t>(firstLine, INT32_MAX)),
+                        static_cast<int>(std::min<uint64_t>(maxTop, INT32_MAX)));
     m_vScroll->setPageStep(visible);
     m_vScroll->setSingleStep(1);
 

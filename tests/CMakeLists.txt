@@ -39,3 +39,16 @@ function(add_loxe_ui_test name)
 endfunction()
 
 add_loxe_ui_test(tst_ViewportEditing)
+
+# XmlContext needs QtCore only, but lives in ui/.
+qt_add_executable(tst_XmlContext
+    tst_XmlContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/ui/XmlContext.cpp
+)
+target_include_directories(tst_XmlContext PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(tst_XmlContext PRIVATE Qt6::Test loxe_engine)
+add_test(NAME tst_XmlContext COMMAND tst_XmlContext)
+set_tests_properties(tst_XmlContext PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

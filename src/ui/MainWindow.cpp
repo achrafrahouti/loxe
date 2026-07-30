@@ -23,6 +23,8 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QClipboard>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
@@ -47,6 +49,8 @@ constexpr int      kValidationDelayMs = 500;
 // rules out an in-memory reformat or a QString-based regex search. Validation
 // is exempt: libxml2 streams it.
 constexpr uint64_t kWholeDocumentLimit = 256ull * 1024 * 1024;
+// Copying more than this to the clipboard is confirmed first.
+constexpr uint64_t kMaxClipboardBytes = 32ull * 1024 * 1024;
 
 QString elide(const QString& s, int maxChars)
 {
@@ -507,6 +511,109 @@ void MainWindow::onTreeNodeActivated(const QModelIndex& index)
     m_viewport->setFocus();
 }
 
+// --- Tree context menu ---
+
+void MainWindow::onTreeContextMenu(const QPoint& pos)
+{
+    auto* model = qobject_cast<VirtualTreeModel*>(m_treeView->model());
+    if (!model) return;
+
+    const QModelIndex index = m_treeView->indexAt(pos);
+    if (!index.isValid()) return;
+
+    m_contextIndex = index;
+    m_treeView->setCurrentIndex(index);
+
+    const QString name = model->tagNameFor(index);
+
+    QMenu menu(this);
+    menu.addAction(tr("Parse <%1> — show only this element").arg(name),
+                   this, &MainWindow::onTreeParseElement);
+    menu.addAction(tr("Copy <%1> to clipboard").arg(name),
+                   this, &MainWindow::onTreeCopyElement);
+    menu.addSeparator();
+    menu.addAction(tr("Copy XPath"), this, &MainWindow::onTreeCopyXPath);
+    menu.addAction(tr("Go to element"), this, [this, index] { onTreeNodeActivated(index); });
+
+    if (m_viewport->hasViewRange()) {
+        menu.addSeparator();
+        menu.addAction(tr("Show whole document"), this, &MainWindow::onShowWholeDocument);
+    }
+
+    menu.exec(m_treeView->viewport()->mapToGlobal(pos));
+}
+
+// Locates the element's byte range, reporting why if it cannot be determined.
+bool MainWindow::contextElementRange(uint64_t* start, uint64_t* end)
+{
+    auto* model = qobject_cast<VirtualTreeModel*>(m_treeView->model());
+    if (!model || !m_contextIndex.isValid()) return false;
+
+    if (!model->elementRange(QModelIndex(m_contextIndex), start, end)) {
+        QMessageBox::warning(this, tr("Element"),
+            tr("Could not determine where this element ends. It may be unclosed, "
+               "or larger than the scan limit."));
+        return false;
+    }
+    return true;
+}
+
+void MainWindow::onTreeParseElement()
+{
+    uint64_t start = 0, end = 0;
+    if (!contextElementRange(&start, &end)) return;
+
+    m_viewport->setViewRange(start, end);
+    m_wholeDocAction->setEnabled(true);
+    m_viewport->setFocus();
+
+    auto* model = qobject_cast<VirtualTreeModel*>(m_treeView->model());
+    const QString name = model ? model->tagNameFor(QModelIndex(m_contextIndex)) : QString();
+    statusBar()->showMessage(
+        tr("Showing <%1> only — %2 bytes. View ▸ Show Whole Document to leave.")
+            .arg(name).arg(end - start), 6000);
+    updateWindowTitle();
+}
+
+void MainWindow::onTreeCopyElement()
+{
+    uint64_t start = 0, end = 0;
+    if (!contextElementRange(&start, &end)) return;
+
+    const uint64_t length = end - start;
+    if (length > kMaxClipboardBytes) {
+        const auto choice = QMessageBox::question(this, tr("Copy element"),
+            tr("This element is %1 MB. Copying it will use at least that much "
+               "memory again.\n\nCopy anyway?").arg(length / (1024 * 1024)),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (choice != QMessageBox::Yes) return;
+    }
+
+    const std::string raw = m_pieceTable->read(start, length);
+    QApplication::clipboard()->setText(
+        QString::fromUtf8(raw.data(), static_cast<qsizetype>(raw.size())));
+    statusBar()->showMessage(tr("Copied %1 bytes to the clipboard").arg(length), 4000);
+}
+
+void MainWindow::onTreeCopyXPath()
+{
+    auto* model = qobject_cast<VirtualTreeModel*>(m_treeView->model());
+    if (!model || !m_contextIndex.isValid()) return;
+
+    const QString path = model->xpathFor(QModelIndex(m_contextIndex));
+    if (path.isEmpty()) return;
+    QApplication::clipboard()->setText(path);
+    statusBar()->showMessage(tr("Copied %1").arg(path), 4000);
+}
+
+void MainWindow::onShowWholeDocument()
+{
+    m_viewport->clearViewRange();
+    m_wholeDocAction->setEnabled(false);
+    updateWindowTitle();
+    statusBar()->showMessage(tr("Showing the whole document"), 3000);
+}
+
 // --- Search ---
 
 void MainWindow::searchFor(const QString& term)
@@ -848,6 +955,7 @@ void MainWindow::setupUi()
 
     m_treeView = new QTreeView(m_splitter);
     m_treeView->setUniformRowHeights(true);
+    m_treeView->setContextMenuPolicy(Qt::CustomContextMenu);
     m_treeView->setAlternatingRowColors(true);
     m_treeView->header()->setStretchLastSection(true);
 
@@ -908,6 +1016,11 @@ void MainWindow::setupMenus()
     m_wordWrapAction = view->addAction(tr("Toggle &Word Wrap"), QKeySequence(Qt::ALT | Qt::Key_Z),
                                        this, &MainWindow::onViewToggleWordWrap);
     m_wordWrapAction->setCheckable(true);
+    m_wholeDocAction = view->addAction(tr("Show &Whole Document"),
+                                       QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_W),
+                                       this, &MainWindow::onShowWholeDocument);
+    m_wholeDocAction->setEnabled(false);
+    view->addSeparator();
     view->addAction(tr("Toggle &Tree Pane"),      {}, this, &MainWindow::onViewToggleTreePane);
     view->addAction(tr("Toggle &Attribute Pane"), {}, this, &MainWindow::onViewToggleAttrPane);
     view->addSeparator();
@@ -935,6 +1048,8 @@ void MainWindow::connectSignals()
     connect(m_viewport, &ViewportRenderer::cursorMoved,    this, &MainWindow::onCursorMoved);
     connect(m_viewport, &ViewportRenderer::documentEdited, this, &MainWindow::onDocumentEdited);
     connect(m_treeView, &QTreeView::activated,            this, &MainWindow::onTreeNodeActivated);
+    connect(m_treeView, &QTreeView::customContextMenuRequested,
+            this, &MainWindow::onTreeContextMenu);
     connect(m_treeView, &QTreeView::clicked,              this, &MainWindow::onTreeNodeActivated);
 
     connect(m_findBar, &FindBar::findNext,        this, &MainWindow::onFindNext);
@@ -1046,6 +1161,7 @@ void MainWindow::updateWindowTitle()
     const QString name = m_currentPath.isEmpty()
         ? tr("Untitled") : QFileInfo(m_currentPath).fileName();
     QString title = QStringLiteral("%1%2 — loxe").arg(name, m_dirty ? QStringLiteral("*") : QString());
+    if (m_viewport && m_viewport->hasViewRange()) title.prepend(tr("[element view] "));
     if (m_isReadOnly) title.prepend(tr("[read-only] "));
     setWindowTitle(title);
 }

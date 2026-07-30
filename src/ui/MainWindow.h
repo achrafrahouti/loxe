@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QPersistentModelIndex>
 #include <QStringList>
 #include <atomic>
 #include <memory>
@@ -77,6 +78,11 @@ private slots:
     void onCursorMoved(uint64_t byteOffset);
     void onDocumentEdited(uint64_t offset);
     void onTreeNodeActivated(const QModelIndex& index);
+    void onTreeContextMenu(const QPoint& pos);
+    void onTreeParseElement();
+    void onTreeCopyElement();
+    void onTreeCopyXPath();
+    void onShowWholeDocument();
 
     // Search
     void onFindNext();
@@ -106,6 +112,8 @@ private:
     // Returns false when the user cancels an unsaved-changes prompt.
     bool confirmDiscardChanges();
     bool writeDocumentTo(const QString& path, QString* error);
+    // Byte range of the element the tree context menu was opened on.
+    bool contextElementRange(uint64_t* start, uint64_t* end);
 
     void updateRecentFiles(const QString& path);
     void rebuildRecentFileMenu();
@@ -139,6 +147,7 @@ private:
     QAction* m_undoAction     = nullptr;
     QAction* m_redoAction     = nullptr;
     QAction* m_wordWrapAction = nullptr;
+    QAction* m_wholeDocAction  = nullptr;
     QAction* m_darkAction     = nullptr;
     QMenu*   m_recentMenu     = nullptr;
 
@@ -159,4 +168,7 @@ private:
     bool        m_ignoreNextWatchEvent = false;
     uint64_t    m_lastMatchStart  = 0;
     uint64_t    m_lastMatchLength = 0;
+
+    // Element the tree context menu was opened on.
+    QPersistentModelIndex m_contextIndex;
 };

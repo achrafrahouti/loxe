@@ -1,8 +1,9 @@
 #include "XmlContext.h"
 #include "../engine/PieceTable.h"
+#include "../engine/XmlScanner.h"
 
 #include <algorithm>
-#include <cctype>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -10,13 +11,15 @@ namespace {
 
 constexpr int kMaxDepth = 128;
 
-struct Tag {
-    enum class Kind { Start, End, SelfClosing, Other };
-    Kind        kind = Kind::Other;
-    QString     name;
-    uint64_t    offset = 0; // offset of the '<'
-    std::string raw;
-};
+QString qs(std::string_view s)
+{
+    return QString::fromUtf8(s.data(), static_cast<qsizetype>(s.size()));
+}
+
+bool isSpace(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
 
 bool isNameChar(char c)
 {
@@ -24,53 +27,29 @@ bool isNameChar(char c)
     return std::isalnum(u) || c == '_' || c == ':' || c == '-' || c == '.' || u >= 0x80;
 }
 
-// Classifies the markup starting at `raw[0] == '<'`.
-Tag classify(std::string raw, uint64_t offset)
-{
-    Tag t;
-    t.offset = offset;
-    t.raw    = std::move(raw);
-    const std::string& s = t.raw;
-
-    if (s.size() < 2) return t;
-    if (s[1] == '?' || s[1] == '!') return t; // PI, comment, CDATA, DOCTYPE
-
-    size_t i = 1;
-    if (s[i] == '/') { t.kind = Tag::Kind::End; ++i; }
-    else             { t.kind = Tag::Kind::Start; }
-
-    const size_t nameStart = i;
-    while (i < s.size() && isNameChar(s[i])) ++i;
-    if (i == nameStart) { t.kind = Tag::Kind::Other; return t; }
-    t.name = QString::fromUtf8(s.data() + nameStart, static_cast<int>(i - nameStart));
-
-    if (t.kind == Tag::Kind::Start && s.size() >= 2 && s[s.size() - 2] == '/')
-        t.kind = Tag::Kind::SelfClosing;
-    return t;
-}
-
-// Parses the attributes of a start tag's raw text.
-QList<QPair<QString, QString>> parseAttributes(const std::string& raw)
+// Parses the attributes out of a start tag's raw source, e.g.
+// `<item id="5" name='z'>` → {{id,5},{name,z}}.
+QList<QPair<QString, QString>> parseAttributes(std::string_view raw)
 {
     QList<QPair<QString, QString>> out;
+
     size_t i = 1;
     if (i < raw.size() && raw[i] == '/') ++i;
     while (i < raw.size() && isNameChar(raw[i])) ++i; // skip the element name
 
-    while (i < raw.size()) {
-        while (i < raw.size() && std::isspace(static_cast<unsigned char>(raw[i]))) ++i;
+    while (i < raw.size() && out.size() < 256) {
+        while (i < raw.size() && isSpace(raw[i])) ++i;
         if (i >= raw.size() || raw[i] == '>' || raw[i] == '/') break;
 
         const size_t nameStart = i;
         while (i < raw.size() && isNameChar(raw[i])) ++i;
-        if (i == nameStart) { ++i; continue; }
-        const QString name = QString::fromUtf8(raw.data() + nameStart,
-                                               static_cast<int>(i - nameStart));
+        if (i == nameStart) { ++i; continue; } // not a name — skip the byte
+        const QString name = qs(raw.substr(nameStart, i - nameStart));
 
-        while (i < raw.size() && std::isspace(static_cast<unsigned char>(raw[i]))) ++i;
+        while (i < raw.size() && isSpace(raw[i])) ++i;
         if (i >= raw.size() || raw[i] != '=') { out.append({name, {}}); continue; }
         ++i;
-        while (i < raw.size() && std::isspace(static_cast<unsigned char>(raw[i]))) ++i;
+        while (i < raw.size() && isSpace(raw[i])) ++i;
         if (i >= raw.size()) break;
 
         QString value;
@@ -78,13 +57,12 @@ QList<QPair<QString, QString>> parseAttributes(const std::string& raw)
             const char quote = raw[i++];
             const size_t valStart = i;
             while (i < raw.size() && raw[i] != quote) ++i;
-            value = QString::fromUtf8(raw.data() + valStart, static_cast<int>(i - valStart));
+            value = qs(raw.substr(valStart, i - valStart));
             if (i < raw.size()) ++i;
         } else {
             const size_t valStart = i;
-            while (i < raw.size() && !std::isspace(static_cast<unsigned char>(raw[i]))
-                   && raw[i] != '>' && raw[i] != '/') ++i;
-            value = QString::fromUtf8(raw.data() + valStart, static_cast<int>(i - valStart));
+            while (i < raw.size() && !isSpace(raw[i]) && raw[i] != '>' && raw[i] != '/') ++i;
+            value = qs(raw.substr(valStart, i - valStart));
         }
         out.append({name, value});
     }
@@ -100,66 +78,75 @@ XmlContextInfo contextAt(const PieceTable& doc, uint64_t offset, uint64_t budget
     XmlContextInfo info;
     const uint64_t docLen = doc.length();
     offset = std::min(offset, docLen);
-    if (offset == 0) return info;
 
-    const uint64_t floorOffset = (offset > budget) ? offset - budget : 0;
-    if (floorOffset > 0) info.truncated = true;
+    // --- Ancestors -----------------------------------------------------------
+    //
+    // Scan *forward* from the cursor. An element encloses the cursor exactly
+    // when its end tag turns up with no matching start tag in between, so the
+    // unmatched end tags are the ancestor chain, innermost first.
+    //
+    // Going forwards rather than backwards is what makes this correct: the
+    // scanner understands comments, CDATA, processing instructions and quoted
+    // attribute values, so a '<' inside any of them cannot be mistaken for a
+    // tag. It also means an unclosed element before the cursor (an HTML-style
+    // <br>, say) is simply never seen, instead of being reported as an ancestor.
+    const uint64_t forwardEnd = std::min(docLen, offset + budget);
 
-    // Read the whole window at once: the budget caps it at a few MB.
-    const uint64_t windowLen = offset - floorOffset;
-    const std::string window  = doc.read(floorOffset, windowLen);
-    if (window.empty()) return info;
+    std::vector<QString> inner;   // innermost → outermost
+    int depth = 0;
 
-    // Walk backwards over '<' positions, matching end tags to start tags.
-    std::vector<Tag> ancestors;
-    int  pendingClose = 0;
-    auto pos          = static_cast<long long>(window.size()) - 1;
-
-    while (pos >= 0 && static_cast<int>(ancestors.size()) < kMaxDepth) {
-        // Find the previous '<'.
-        while (pos >= 0 && window[static_cast<size_t>(pos)] != '<') --pos;
-        if (pos < 0) break;
-
-        // Take the tag's text up to its '>' (may run past the cursor, which is
-        // exactly what we want when the cursor sits inside a start tag).
-        const size_t start = static_cast<size_t>(pos);
-        size_t       end   = window.find('>', start);
-        std::string  raw;
-        if (end == std::string::npos) {
-            // Unterminated within the window — read forward from the document.
-            const std::string ahead = doc.read(floorOffset + start, 8192);
-            const size_t gt = ahead.find('>');
-            raw = (gt == std::string::npos) ? ahead : ahead.substr(0, gt + 1);
-        } else {
-            raw = window.substr(start, end - start + 1);
-        }
-
-        const Tag tag = classify(std::move(raw), floorOffset + start);
-        switch (tag.kind) {
-        case Tag::Kind::End:
-            ++pendingClose;
+    XmlScanner::scan(doc, offset, forwardEnd, [&](const XmlNode& n) {
+        switch (n.kind) {
+        case XmlNode::Kind::StartTag:
+            ++depth;
             break;
-        case Tag::Kind::Start:
-            if (pendingClose > 0) --pendingClose;
-            else                  ancestors.push_back(tag);
+        case XmlNode::Kind::EndTag:
+            if (depth == 0) {
+                inner.push_back(qs(n.name));
+                if (static_cast<int>(inner.size()) >= kMaxDepth) return false;
+            } else {
+                --depth;
+            }
             break;
-        case Tag::Kind::SelfClosing:
-        case Tag::Kind::Other:
+        default:
             break;
         }
+        return true;
+    });
 
-        --pos;
-    }
+    // Running out of budget before the outermost element closed means the
+    // chain is missing its top; say so rather than showing a wrong root.
+    if (forwardEnd < docLen && static_cast<int>(inner.size()) < kMaxDepth)
+        info.truncated = true;
 
-    // ancestors was built innermost-first.
-    std::reverse(ancestors.begin(), ancestors.end());
-    for (const Tag& t : ancestors) info.ancestors << t.name;
+    for (auto it = inner.rbegin(); it != inner.rend(); ++it)
+        info.ancestors << *it;
 
-    if (!ancestors.empty()) {
-        const Tag& innermost = ancestors.back();
-        info.tagName    = innermost.name;
-        info.attributes = parseAttributes(innermost.raw);
-    }
+    if (info.ancestors.isEmpty()) return info;
+    info.tagName = info.ancestors.last();
+
+    // --- Attributes of the innermost element ---------------------------------
+    //
+    // Its start tag is behind the cursor. Scan a bounded window up to the cursor
+    // and keep the last start tag carrying that name: the innermost open element
+    // is by definition the most recent unclosed one.
+    const uint64_t windowStart = (offset > budget) ? offset - budget : 0;
+    const std::string wanted   = info.tagName.toStdString();
+
+    // The window runs past the cursor so that a start tag the cursor sits
+    // *inside* is still seen whole; `offset` only has to fall within the tag,
+    // which the offset test below enforces.
+    std::string lastRaw;
+    XmlScanner::scan(doc, windowStart, forwardEnd, [&](const XmlNode& n) {
+        if (n.offset > offset) return false; // past the cursor: done
+        if (n.kind == XmlNode::Kind::StartTag && n.name == wanted)
+            lastRaw.assign(n.raw);
+        return true;
+    });
+
+    if (!lastRaw.empty())
+        info.attributes = parseAttributes(lastRaw);
+
     return info;
 }
 

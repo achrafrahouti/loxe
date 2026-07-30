@@ -23,7 +23,7 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   under both with leak detection on
 - GitHub Actions CI matrix (ubuntu-22.04 + macos-13)
 - Linux `.desktop` file and macOS `Info.plist` bundle metadata
-- 9 Qt Test binaries, ~185 test functions, all passing
+- 10 Qt Test binaries, ~210 test functions, all passing
 
 ## Engine layer
 
@@ -144,6 +144,11 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   ~65 000 columns per row to display ~125, costing 1.5 s per repaint
 - A line longer than the budget is still **one** line: the remainder is reached
   by scrolling right, not shown as extra rows with invented line numbers
+- **Scoped view** (`setViewRange`): rendering, navigation, selection and the
+  cursor can be restricted to a byte range so a single element is shown on its
+  own. Gutter numbers stay absolute, edits still target real document offsets so
+  saving is unaffected, and the range follows edits made inside it. Undo drops
+  the scope, since a byte range can no longer be trusted to bound the element
 - Blinking caret honouring the platform flash time
 - Keyboard: arrows, Home/End, Ctrl+Home/End, Page Up/Down, Shift+movement for
   selection, Enter, Tab, Backspace, Delete, Ctrl+A/C/X/V
@@ -174,11 +179,24 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
   expansion, whichever trips first; the parent is then flagged partial
 - Three columns: element, first-attribute summary, text preview
 - `indexForOffset()` maps a caret position back to the deepest loaded node
+- `elementRange()` returns an element's full source range, discovering the end
+  offset lazily with a nesting-aware scan so a same-named descendant cannot
+  close it early
+- `xpathFor()` builds a location path, adding positional predicates only where
+  a name repeats among siblings (`/orders/order[3]/total`)
 
 ### XmlContext (new)
-- Recovers the open-element chain around a byte offset by scanning backwards
-  with a bounded budget (4 MB), matching end tags against start tags
-- Feeds the breadcrumb bar and the attribute panel
+- Recovers the chain of elements enclosing a byte offset, feeding the breadcrumb
+  bar and the attribute panel
+- Works **forwards** from the cursor over XmlScanner: an element encloses the
+  cursor exactly when its end tag appears with no matching start tag in between,
+  so the unmatched end tags are the ancestors. This is what makes it correct —
+  a backward scan reported `/br/br/br` instead of an XPath, because it counted
+  unclosed elements as ancestors and mistook `<` inside comments, CDATA sections
+  and attribute values for real tags
+- Attributes of the innermost element come from a bounded window that reaches
+  just past the cursor, so a start tag the caret sits *inside* is still parsed
+- Both scans are bounded (1 MB); an incomplete chain is flagged truncated
 
 ### FindBar (new)
 - Inline find / replace bar: incremental search as you type, next/previous,
@@ -208,6 +226,12 @@ SSD, Release build). "Element-dense" means ~216 M elements (≈10 bytes each);
 - Word wrap, tree pane, attribute pane and dark theme toggles, persisted
 - Session geometry, window state and splitter position via `QSettings`
 - Drag-and-drop file opening
+- **Tree context menu** (right-click an element):
+  - *Parse <name> — show only this element*: scopes the editor to that element
+  - *Copy <name> to clipboard*: its full source, with a confirmation above 32 MB
+  - *Copy XPath*, *Go to element*, and *Show whole document* when scoped
+  - View ▸ Show Whole Document (Ctrl+Shift+W) leaves the scope; the title bar
+    carries an `[element view]` marker while it is active
 
 ### CLI
 - `--line N`, `--search TERM`, `--ro` all wired up

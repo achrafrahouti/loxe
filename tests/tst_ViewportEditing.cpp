@@ -46,6 +46,13 @@ private slots:
     void undoRedo_restoresDocumentAndCursor();
     void readOnly_rejectsEdits();
 
+    // Scoped view ("parse this element only").
+    void viewRange_clampsCursorToScope();
+    void viewRange_rendersOnlyTheScope();
+    void viewRange_editInsideScopeAdjustsEnd();
+    void viewRange_clearRestoresWholeDocument();
+    void viewRange_undoDropsTheScope();
+
     // Minified documents (one enormous line).
     void flatDocument_reportsSingleLine();
     void flatDocument_cursorEndStaysOnLineOne();
@@ -336,6 +343,101 @@ void tst_ViewportEditing::readOnly_rejectsEdits()
 
     QCOMPARE(text(), std::string("<a/>"));
     QVERIFY(!m_table->canUndo());
+}
+
+// --- Scoped view ---
+
+void tst_ViewportEditing::viewRange_clampsCursorToScope()
+{
+    //           0123456789...
+    setDoc("<r><a>AAA</a><b>BBB</b><c>CCC</c></r>");
+    const std::string all = text();
+    const auto bStart = static_cast<uint64_t>(all.find("<b>"));
+    const auto bEnd   = static_cast<uint64_t>(all.find("</b>") + 4);
+
+    m_viewport->setViewRange(bStart, bEnd);
+    QVERIFY(m_viewport->hasViewRange());
+    QCOMPARE(m_viewport->viewRangeStart(), bStart);
+    QCOMPARE(m_viewport->viewRangeEnd(), bEnd);
+
+    // The cursor lands at the start of the element and cannot leave the scope.
+    QCOMPARE(m_viewport->cursorOffset(), bStart);
+
+    key(Qt::Key_Home, Qt::ControlModifier);
+    QCOMPARE(m_viewport->cursorOffset(), bStart);
+
+    key(Qt::Key_End, Qt::ControlModifier);
+    QCOMPARE(m_viewport->cursorOffset(), bEnd);
+
+    key(Qt::Key_Right);
+    QCOMPARE(m_viewport->cursorOffset(), bEnd); // clamped at the scope end
+}
+
+void tst_ViewportEditing::viewRange_rendersOnlyTheScope()
+{
+    setDoc("<r>\n  <a>AAA</a>\n  <b>BBB</b>\n  <c>CCC</c>\n</r>\n");
+    const std::string all = text();
+    const auto bStart = static_cast<uint64_t>(all.find("<b>"));
+    const auto bEnd   = static_cast<uint64_t>(all.find("</b>") + 4);
+
+    m_viewport->setViewRange(bStart, bEnd);
+
+    // Select everything the scope exposes: it must be exactly the element.
+    m_viewport->selectAll();
+    QCOMPARE(m_viewport->selectedText(), QStringLiteral("<b>BBB</b>"));
+}
+
+void tst_ViewportEditing::viewRange_editInsideScopeAdjustsEnd()
+{
+    setDoc("<r><a>AAA</a><b>BBB</b></r>");
+    const std::string all = text();
+    const auto bStart = static_cast<uint64_t>(all.find("<b>"));
+    const auto bEnd   = static_cast<uint64_t>(all.find("</b>") + 4);
+
+    m_viewport->setViewRange(bStart, bEnd);
+    m_viewport->setCursorOffset(bStart + 3); // just inside <b>
+    type(QStringLiteral("XY"));
+
+    // The element grew by two bytes, so the scope must grow with it or its
+    // closing tag would fall outside the view.
+    QCOMPARE(m_viewport->viewRangeEnd(), bEnd + 2);
+    m_viewport->selectAll();
+    QCOMPARE(m_viewport->selectedText(), QStringLiteral("<b>XYBBB</b>"));
+
+    // The edit landed in the real document, not a detached copy.
+    QCOMPARE(text(), std::string("<r><a>AAA</a><b>XYBBB</b></r>"));
+}
+
+void tst_ViewportEditing::viewRange_clearRestoresWholeDocument()
+{
+    setDoc("<r><a>AAA</a><b>BBB</b></r>");
+    const std::string all = text();
+    m_viewport->setViewRange(static_cast<uint64_t>(all.find("<b>")),
+                             static_cast<uint64_t>(all.find("</b>") + 4));
+    QVERIFY(m_viewport->hasViewRange());
+
+    m_viewport->clearViewRange();
+    QVERIFY(!m_viewport->hasViewRange());
+    m_viewport->selectAll();
+    QCOMPARE(m_viewport->selectedText().toStdString(), all);
+}
+
+void tst_ViewportEditing::viewRange_undoDropsTheScope()
+{
+    // Undo can change the document arbitrarily, so a byte range can no longer
+    // be trusted to bound the same element.
+    setDoc("<r><b>BBB</b></r>");
+    const std::string all = text();
+    m_viewport->setViewRange(static_cast<uint64_t>(all.find("<b>")),
+                             static_cast<uint64_t>(all.find("</b>") + 4));
+
+    m_viewport->setCursorOffset(m_viewport->viewRangeStart() + 3);
+    type(QStringLiteral("Z"));
+    QVERIFY(m_viewport->hasViewRange());
+
+    m_viewport->undo();
+    QVERIFY(!m_viewport->hasViewRange());
+    QCOMPARE(text(), all);
 }
 
 // --- Minified documents ---

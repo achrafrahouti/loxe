@@ -24,6 +24,18 @@ public:
 
     void setDocument(PieceTable* table, SparseLineIndex* index);
 
+    // --- Scoped view ---
+    //
+    // Restricts rendering, navigation and the cursor to [start, end) so a single
+    // element can be examined without the rest of the document. Editing still
+    // targets real document offsets, so saving is unaffected; the range follows
+    // edits made inside it.
+    void     setViewRange(uint64_t start, uint64_t end);
+    void     clearViewRange();
+    bool     hasViewRange()    const { return m_rangeActive; }
+    uint64_t viewRangeStart()  const;
+    uint64_t viewRangeEnd()    const;
+
     uint64_t cursorOffset() const { return m_cursorOffset; }
     int      tabWidth()     const { return m_tabWidth; }
     bool     wordWrap()     const { return m_wordWrap; }
@@ -137,13 +149,18 @@ private:
     void wordBoundsAt(uint64_t offset, uint64_t* start, uint64_t* end) const;
 
     void moveCursor(uint64_t offset, bool extendSelection);
-    void applyEdit(uint64_t offset); // shared post-mutation bookkeeping
+    // Shared post-mutation bookkeeping. `delta` is the document's change in
+    // length, used to keep a scoped view's end offset in step.
+    void applyEdit(uint64_t offset, int64_t delta);
 
     // Previous / next byte offset respecting UTF-8 sequence boundaries.
     uint64_t prevCharOffset(uint64_t offset) const;
     uint64_t nextCharOffset(uint64_t offset) const;
 
+    // Length of the *addressable* document: the scope end when scoped.
     uint64_t documentLength() const;
+    // Real document length, ignoring any scope.
+    uint64_t rawDocumentLength() const;
 
     PieceTable*             m_table       = nullptr;
     SparseLineIndex*        m_index       = nullptr;
@@ -158,6 +175,10 @@ private:
 
     uint64_t m_matchStart  = 0;
     uint64_t m_matchLength = 0;
+
+    bool     m_rangeActive = false;
+    uint64_t m_rangeStart  = 0;
+    uint64_t m_rangeEnd    = 0;
 
     int  m_tabWidth   = 4;
     bool m_wordWrap   = false;

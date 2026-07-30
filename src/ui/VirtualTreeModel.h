@@ -81,6 +81,18 @@ public:
     // Returns the byte offset for the node at index (used by ViewportRenderer sync).
     uint64_t byteOffsetFor(const QModelIndex& index) const;
 
+    // Byte range [start, end) covering the element's full source, closing tag
+    // included. The end offset is discovered lazily when it is not already
+    // known, so this can cost a bounded scan of the element's subtree.
+    // Returns false when the range cannot be determined.
+    bool elementRange(const QModelIndex& index, uint64_t* start, uint64_t* end) const;
+
+    // Location path to the element, with positional predicates where a name is
+    // repeated among siblings, e.g. /orders/order[3]/total.
+    QString xpathFor(const QModelIndex& index) const;
+
+    QString tagNameFor(const QModelIndex& index) const;
+
     // Deepest already-loaded node whose byte range contains `offset`, or an
     // invalid index. Used to follow the caret in the tree without forcing loads.
     QModelIndex indexForOffset(uint64_t offset) const;
@@ -94,6 +106,11 @@ private:
 
     // Returns the row of nodeIdx among its siblings (O(siblings)).
     int rowOfNode(int nodeIdx) const;
+
+    // Root-level nodes are not linked by nextSibling, so they are walked by
+    // scanning for parentIndex == -1.
+    int firstRootNode() const;
+    int nextRootNode(int from) const;
 
     const PieceTable*     m_doc = nullptr;
     std::vector<TreeNode> m_nodes;
