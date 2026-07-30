@@ -177,8 +177,11 @@ are not "fixed" by accident.
 - [x] AppImage: `linuxdeploy` + Qt plugin wired into the CI Linux job
 - [x] Application icon (`packaging/linux/loxe.png`), required by `linuxdeploy`
       because `loxe.desktop` declares `Icon=loxe`
-- [ ] macOS: `create-dmg` instead of raw `hdiutil`, plus code-signing and
-      notarisation (the DMG is currently unsigned, so Gatekeeper will block it)
+- [ ] macOS DMG packaging is **commented out** in `.github/workflows/ci.yml`;
+      the macOS job still builds and tests. When re-enabling: switch to
+      `create-dmg` instead of raw `hdiutil`, add code-signing and notarisation
+      (an unsigned DMG is blocked by Gatekeeper), and drop the `runner.os`
+      condition on the upload step
 - [ ] Linux `.desktop` MIME type registration (`application/xml`, `text/xml`)
 - [ ] AppStream metadata for software-center discovery
 - [ ] macOS `QFileOpenEvent` handling (Finder open, Dock drag)

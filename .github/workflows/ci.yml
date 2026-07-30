@@ -13,6 +13,7 @@ jobs:
         include:
           - os: ubuntu-22.04
             artifact_name: loxe.AppImage
+          # Builds and tests only; DMG packaging is commented out below.
           - os: macos-13
             artifact_name: loxe.dmg
 
@@ -85,14 +86,23 @@ jobs:
             --plugin qt \
             --output appimage
 
-      - name: Package (macOS DMG)
-        if: runner.os == 'macOS'
-        run: |
-          macdeployqt build/src/loxe.app
-          # TODO: codesign and notarise
-          hdiutil create -volname loxe -srcfolder build/src/loxe.app -ov -format UDZO loxe.dmg
+      # macOS packaging is disabled for now — no DMG is wanted yet. The macOS job
+      # still builds and runs the tests, which is what catches portability
+      # breakage (it uses the libxml2 that ships with the SDK rather than
+      # libxml2-dev). Re-enable by uncommenting this step and dropping the
+      # runner.os condition on "Upload artifact" below.
+      #
+      # - name: Package (macOS DMG)
+      #   if: runner.os == 'macOS'
+      #   run: |
+      #     macdeployqt build/src/loxe.app
+      #     # TODO: codesign and notarise
+      #     hdiutil create -volname loxe -srcfolder build/src/loxe.app -ov -format UDZO loxe.dmg
 
       - name: Upload artifact
+        # Linux only while macOS packaging is off: with nothing to upload, the
+        # if-no-files-found guard below would fail the macOS job.
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
